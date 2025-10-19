@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 import os
-from src.financial_news import get_news
+from src.financial_news import get_news_finnhub
 from src.news_sentimental_analysis import scoring
 
 def main():
@@ -9,7 +9,7 @@ def main():
 
     ticker = input("Enter the company ticker: ")
 
-    news = get_news(api_key, ticker)
+    news = get_news_finnhub(api_key, ticker)
 
     result = scoring(news)
 

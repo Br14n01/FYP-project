@@ -1,6 +1,7 @@
 import finnhub
+import yfinance as yf
 
-def get_news(api_key, ticker='AAPL'):
+def get_news_finnhub(api_key, ticker='AAPL'):
     
 
     finnhub_client = finnhub.Client(api_key=api_key)
@@ -11,3 +12,8 @@ def get_news(api_key, ticker='AAPL'):
                                             )
 
     return company_news[1]['summary']
+
+def get_news_yf(ticker='AAPL'):
+    news = yf.Search(ticker, news_count=10).news
+
+    return news

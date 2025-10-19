@@ -1,20 +1,20 @@
-VOO
-QQQ
-AAPL
-MSFT
-NVDA
-TSLA
-AMZN
-JPM
-BAC
-GS
-CVX
-OXY
-UNH
-JNJ
-PG
-KO
-MCD
-DIS
-CAT
-T
+VOO: Vanguard S&P 500 ETF               Exchange-Traded Fund 
+QQQ: Invesco QQQ Trust                  Exchange-Traded Fund 
+AAPL: Apple Inc.                        Technology 
+MSFT: Microsoft Corporation             Technology 
+NVDA: NVIDIA Corporation                Technology 
+TSLA: Tesla Inc.                        Technology 
+AMZN: Amazon.com Inc.                   Technology / E-commerce
+JPM: JPMorgan Chase & Co.               Financials 
+BAC: Bank of America Corporation        Financials 
+GS: Goldman Sachs Group Inc.            Financials 
+CVX: Chevron Corporation                Energy 
+OXY: Occidental Petroleum Corporation   Energy 
+UNH: UnitedHealth Group Incorporated    Healthcare 
+JNJ: Johnson & Johnson                  Healthcare 
+PG: Procter & Gamble Company            Consumer Staples 
+KO: Coca-Cola Company                   Consumer Staples 
+CAT: Caterpillar Inc.                   Industrials 
+T: AT&T Inc.                            Industrials
+BTC: Bitcoin                            Cryptocurrency
+ETH: Ethereum                           Cryptocurrency
