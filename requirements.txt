@@ -2,3 +2,6 @@ finnhub-python==2.4.25
 torch==2.9.0+cu128
 transformers==4.57.1
 yfinance==0.2.66
+ipykernel==7.0.1
+requests==2.32.5
+beautifulsoup4==4.14.2
