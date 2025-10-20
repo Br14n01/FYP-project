@@ -5,3 +5,6 @@ yfinance==0.2.66
 ipykernel==7.0.1
 requests==2.32.5
 beautifulsoup4==4.14.2
+gliner==0.2.22
+sentence-transformers==5.1.1
+dotenv
