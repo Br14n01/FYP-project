@@ -9,6 +9,6 @@ def scoring(text):
                    model=finbert, 
                    tokenizer=tokenizer
                    )
-    result = nlp(text)
+    result = nlp(text, truncation=True)
 
     return result

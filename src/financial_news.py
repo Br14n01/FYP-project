@@ -1,36 +1,51 @@
-import finnhub
 import feedparser 
 from urllib.parse import urlparse, parse_qs, quote
 import requests
 from bs4 import BeautifulSoup
+import json
 
-def get_news_finnhub(api_key, ticker='AAPL'):
-    finnhub_client = finnhub.Client(api_key=api_key)
+def resolve_google_news_url(google_url):
+    resp = requests.get(google_url)
+    data = BeautifulSoup(resp.text, 'html.parser').select_one('c-wiz[data-p]').get('data-p')
+    obj = json.loads(data.replace('%.@.', '["garturlreq",'))
 
-    company_news = finnhub_client.company_news(ticker, 
-                                            _from="2025-10-15"
-                                            ,to="2025-10-18"
-                                            )
+    payload = {
+        'f.req': json.dumps([[['Fbv4je', json.dumps(obj[:-6] + obj[-2:]), 'null', 'generic']]])
+    }
 
-    return company_news[0]['summary']
+    headers = {
+    'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+    }
+
+    url = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
+    response = requests.post(url, headers=headers, data=payload)
+    array_string = json.loads(response.text.replace(")]}'", ""))[0][2]
+    article_url = json.loads(array_string)[1]
+    return article_url
 
 def fetch_article_content(url):
-    """
-    Fetch article text from the resolved publisher URL.
-    """
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=10,
+                                headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
 
         # Grab all paragraph text
         paragraphs = soup.find_all('p')
         content = ' '.join([p.get_text() for p in paragraphs])
+        # Remove common boilerplate phrases
+        boilerplate_phrases = [
+            "Oops, something went wrong",
+            "Something went wrong"
+        ]
+        for phrase in boilerplate_phrases:
+            content = content.replace(phrase, "")
         return content.strip() if content else "No readable content found."
     except requests.RequestException:
         return "Content not retrieved."
 
-def fetch_news(query, num_articles=10):
+def fetch_news(query, num_articles=5):
     """
     Retrieve recent news articles from Google News RSS for a given search query.
 
@@ -56,10 +71,9 @@ def fetch_news(query, num_articles=10):
     articles = []
     for item in news_items:
         title = item.title
-        link = item.link
+        link = resolve_google_news_url(item.link)
         published = item.published
         content = fetch_article_content(link)
-        
         articles.append({
             "title": title,
             "link": link,
