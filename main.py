@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 import os
-from src.financial_news import *
-from src.news_sentimental_analysis import scoring
+from src.sentiment.financial_news import *
+from src.sentiment.news_sentimental_analysis import scoring
 
 def main():
 

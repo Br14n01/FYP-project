@@ -9,12 +9,12 @@ import os
 
 class TradingStock():
 
-    def __init__(self, ticker: str = None, period: str = '1y', windows: list = None):
+    def __init__(self, ticker: str = None, period: str = '1y', interval: str = '1d', windows: list = None):
         """
         Parameters
         ----------
         ticker: stock ticker symbol
-        ma_windows: list of integers for MA window sizes (default: [20, 40, 80, 120])
+        windows: list of integers for MA window sizes (default: [20, 40, 80, 120])
         """
         self.ticker = ticker
         self.period = period
@@ -23,17 +23,15 @@ class TradingStock():
 
 
 
-    def Ticker(self, ticker, period='1y'):
+    def fetch(self):
         """
         Load Stock data by Ticker.
         """
-        self.data = yf.Ticker(ticker).history(period=period)
+        self.data = yf.Ticker(self.ticker).history(period=self.period)
         self.data.drop("Dividends", axis=1, inplace=True)
 
-        return self
 
     def download_indicators(self):
-        backrolling = 5
 
         if self.data is not None and not self.data.empty:
             # Calculate and add indicators
@@ -52,13 +50,14 @@ class TradingStock():
                 self.data[ma_col] = self.data.ta.sma(length=window)
                 self.data[slope_col] = (
                     self.data[ma_col]
-                    .rolling(window=backrolling)
+                    .rolling(window=window)
                     .apply(get_slope, raw=True)
                 )
 
             # Ensure directory exists
-            os.makedirs("../../dataset", exist_ok=True)
+            os.makedirs("dataset", exist_ok=True)
 
             # Save to CSV file
-            file_path = f"../../dataset/{self.ticker}_historical_data.csv"
-            self.data.to_csv(file_path, header=True, index=False)
+            file_path = f"dataset/{self.ticker}_historical_data.csv"
+            print(f"Saving data to {file_path}")
+            self.data.to_csv(file_path, header=True, index=True)
