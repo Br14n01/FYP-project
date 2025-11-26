@@ -29,12 +29,15 @@ class TradingStock():
         """
         self.data = yf.Ticker(self.ticker).history(period=self.period)
         self.data.drop("Dividends", axis=1, inplace=True)
+        self.data.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'], inplace=True)
+        return self
 
 
     def download_indicators(self):
 
         if self.data is not None and not self.data.empty:
             # Calculate and add indicators
+            """
             self.data['ATR'] = self.data.ta.atr(length=20)
             self.data['RSI'] = self.data.ta.rsi()
             self.data['MidPrice'] = self.data.ta.midprice(length=1)
@@ -53,6 +56,7 @@ class TradingStock():
                     .rolling(window=window)
                     .apply(get_slope, raw=True)
                 )
+            """
 
             # Ensure directory exists
             os.makedirs("dataset", exist_ok=True)
