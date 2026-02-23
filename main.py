@@ -1,11 +1,13 @@
-from dotenv import load_dotenv
+
+import yfinance as yf
 import os
-from src.sentiment.financial_news import *
-from src.sentiment.news_sentimental_analysis import scoring
-from src.technical import *
+# from src.sentiment.financial_news import *
+# from src.sentiment.news_sentimental_analysis import scoring
+# from src.technical import *
 
 def main():
 
+    """
     queries = [
         "AAPL"
     ]
@@ -27,6 +29,10 @@ def main():
         result = scoring(article['title'])
         print(f"Label: {result[0]['label']}")
         print(f"Score: {result[0]['score']}")
+        """
+    df = yf.download("AAPL", period="1y")
+    print(df.head())
+
 
 if __name__ == "__main__":
     main()

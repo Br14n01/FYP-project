@@ -30,7 +30,7 @@ class TradingStock():
         self.data = yf.Ticker(self.ticker).history(period=self.period)
         self.data.drop("Dividends", axis=1, inplace=True)
         self.data.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'], inplace=True)
-        return self
+        return self.data
 
 
     def download_indicators(self):
