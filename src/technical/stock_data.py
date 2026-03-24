@@ -1,7 +1,6 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import pandas_ta as ta
 import matplotlib.pyplot as plt
 from scipy.stats import linregress
 import os

@@ -1,0 +1,490 @@
+"""
+Training pipeline: XGBoost / Random Forest with walk-forward validation,
+multi-configuration comparison, and SHAP feature importance.
+
+Usage:
+    from src.ml.train import run_experiment
+    results = run_experiment("AAPL")
+"""
+
+import os
+import json
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    roc_curve,
+    auc,
+)
+from xgboost import XGBClassifier
+
+from src.ml.features import (
+    build_feature_matrix,
+    get_feature_columns,
+    get_sentiment_only_columns,
+    OHLCV_COLS,
+    SENTIMENT_FEATURE_COLS,
+)
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+# ---------------------------------------------------------------------------
+# Model factories
+# ---------------------------------------------------------------------------
+
+def _xgb_model(n_classes: int = 3) -> XGBClassifier:
+    return XGBClassifier(
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.8,
+        objective="multi:softprob",
+        num_class=n_classes,
+        n_jobs=-1,
+        eval_metric="mlogloss",
+        random_state=42,
+    )
+
+
+def _rf_model() -> RandomForestClassifier:
+    return RandomForestClassifier(
+        n_estimators=300,
+        max_depth=12,
+        min_samples_split=5,
+        n_jobs=-1,
+        random_state=42,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward validation
+# ---------------------------------------------------------------------------
+
+def walk_forward_validate(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    label_col: str = "label",
+    model_type: str = "xgboost",
+    n_splits: int = 5,
+) -> tuple[pd.DataFrame, object]:
+    """
+    Time-series walk-forward cross-validation.
+
+    Returns (metrics_df, last_trained_model).
+    """
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    fold_metrics = []
+    model = None
+
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(df)):
+        train = df.iloc[train_idx]
+        test = df.iloc[test_idx]
+        X_train, y_train = train[feature_cols], train[label_col]
+        X_test, y_test = test[feature_cols], test[label_col]
+
+        if model_type == "xgboost":
+            model = _xgb_model(n_classes=int(y_train.nunique()))
+        else:
+            model = _rf_model()
+
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+
+        fold_metrics.append(
+            {
+                "fold": fold + 1,
+                "start": str(test.index[0]),
+                "end": str(test.index[-1]),
+                "accuracy": accuracy_score(y_test, y_pred),
+                "f1_macro": f1_score(y_test, y_pred, average="macro"),
+                "precision_macro": precision_score(
+                    y_test, y_pred, average="macro", zero_division=0
+                ),
+                "recall_macro": recall_score(
+                    y_test, y_pred, average="macro", zero_division=0
+                ),
+            }
+        )
+
+    return pd.DataFrame(fold_metrics), model
+
+
+# ---------------------------------------------------------------------------
+# Full train/test split evaluation with detailed metrics
+# ---------------------------------------------------------------------------
+
+def train_and_evaluate(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    label_col: str = "label",
+    model_type: str = "xgboost",
+    train_ratio: float = 0.8,
+) -> tuple[dict, object, np.ndarray, np.ndarray]:
+    """
+    Simple chronological train/test split.
+    Returns (metrics_dict, model, y_test, y_pred).
+    """
+    split = int(len(df) * train_ratio)
+    train, test = df.iloc[:split], df.iloc[split:]
+    X_train, y_train = train[feature_cols], train[label_col]
+    X_test, y_test = test[feature_cols], test[label_col]
+
+    if model_type == "xgboost":
+        model = _xgb_model(n_classes=int(y_train.nunique()))
+    else:
+        model = _rf_model()
+
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    metrics = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "f1_macro": f1_score(y_test, y_pred, average="macro"),
+        "precision_macro": precision_score(
+            y_test, y_pred, average="macro", zero_division=0
+        ),
+        "recall_macro": recall_score(
+            y_test, y_pred, average="macro", zero_division=0
+        ),
+    }
+    return metrics, model, np.array(y_test), y_pred
+
+
+# ---------------------------------------------------------------------------
+# Multi-config comparison
+# ---------------------------------------------------------------------------
+
+CONFIG_NAMES = [
+    "technical_only_xgb",
+    "sentiment_only_xgb",
+    "hybrid_xgb",
+    "hybrid_rf",
+]
+
+
+def run_experiment(
+    symbol: str,
+    start: str = "2022-01-01",
+    end: str | None = None,
+    lookahead: int = 5,
+    thresh: float = 0.01,
+    n_splits: int = 5,
+    output_dir: str = "results",
+) -> dict:
+    """
+    Run the full comparison experiment for a single ticker.
+
+    Trains four configurations:
+      1. technical_only_xgb  – XGBoost on technical indicators only
+      2. sentiment_only_xgb  – XGBoost on sentiment features only
+      3. hybrid_xgb          – XGBoost on combined features
+      4. hybrid_rf           – Random Forest on combined features
+
+    Returns dict of results.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"\n{'='*60}")
+    print(f"  EXPERIMENT: {symbol}")
+    print(f"{'='*60}")
+
+    # Build feature matrix (with sentiment)
+    df = build_feature_matrix(
+        symbol,
+        start=start,
+        end=end,
+        lookahead=lookahead,
+        thresh=thresh,
+        include_sentiment=True,
+    )
+
+    all_features = get_feature_columns(df, include_sentiment=True)
+    tech_features = get_feature_columns(df, include_sentiment=False)
+    sent_features = [c for c in get_sentiment_only_columns() if c in df.columns]
+
+    has_sentiment = len(sent_features) > 0
+
+    configs = {
+        "technical_only_xgb": {"features": tech_features, "model": "xgboost"},
+        "hybrid_xgb": {"features": all_features, "model": "xgboost"},
+        "hybrid_rf": {"features": all_features, "model": "random_forest"},
+    }
+    if has_sentiment:
+        configs["sentiment_only_xgb"] = {
+            "features": sent_features,
+            "model": "xgboost",
+        }
+
+    results = {"symbol": symbol, "configs": {}}
+
+    for config_name, cfg in configs.items():
+        print(f"\n--- {config_name} ({len(cfg['features'])} features) ---")
+
+        # Walk-forward
+        wf_df, last_model = walk_forward_validate(
+            df,
+            cfg["features"],
+            model_type=cfg["model"],
+            n_splits=n_splits,
+        )
+        wf_summary = {
+            "accuracy_mean": wf_df["accuracy"].mean(),
+            "accuracy_std": wf_df["accuracy"].std(),
+            "f1_macro_mean": wf_df["f1_macro"].mean(),
+            "f1_macro_std": wf_df["f1_macro"].std(),
+        }
+
+        # Simple train/test
+        metrics, model, y_test, y_pred = train_and_evaluate(
+            df, cfg["features"], model_type=cfg["model"]
+        )
+
+        results["configs"][config_name] = {
+            "train_test": metrics,
+            "walk_forward": wf_summary,
+            "walk_forward_folds": wf_df.to_dict(orient="records"),
+            "n_features": len(cfg["features"]),
+        }
+
+        print(f"  Train/Test  acc={metrics['accuracy']:.4f}  F1={metrics['f1_macro']:.4f}")
+        print(
+            f"  Walk-Fwd    acc={wf_summary['accuracy_mean']:.4f}±{wf_summary['accuracy_std']:.4f}"
+            f"  F1={wf_summary['f1_macro_mean']:.4f}±{wf_summary['f1_macro_std']:.4f}"
+        )
+
+        # Save confusion matrix for hybrid_xgb
+        if config_name == "hybrid_xgb":
+            _save_confusion_matrix(y_test, y_pred, symbol, output_dir)
+            _save_roc_curves(model, df, cfg["features"], symbol, output_dir)
+
+    # Save SHAP for hybrid_xgb
+    if "hybrid_xgb" in configs:
+        _save_shap(
+            df,
+            configs["hybrid_xgb"]["features"],
+            symbol,
+            output_dir,
+        )
+
+    # Save comparison table
+    _save_comparison_table(results, symbol, output_dir)
+
+    # Persist full results as JSON
+    json_path = os.path.join(output_dir, f"{symbol}_results.json")
+    with open(json_path, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"\nResults saved -> {json_path}")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Visualization helpers
+# ---------------------------------------------------------------------------
+
+def _save_confusion_matrix(
+    y_test: np.ndarray,
+    y_pred: np.ndarray,
+    symbol: str,
+    output_dir: str,
+):
+    cm = confusion_matrix(y_test, y_pred, labels=[0, 1, 2])
+    cmn = cm / cm.sum(axis=1, keepdims=True)
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(
+        cmn,
+        annot=True,
+        fmt=".2f",
+        cmap="Blues",
+        xticklabels=["Neutral", "Bearish", "Bullish"],
+        yticklabels=["Neutral", "Bearish", "Bullish"],
+        ax=ax,
+    )
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(f"{symbol} – Normalised Confusion Matrix (Hybrid XGB)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, f"{symbol}_confusion_matrix.png"), dpi=150)
+    plt.close(fig)
+
+
+def _save_roc_curves(
+    model,
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    symbol: str,
+    output_dir: str,
+):
+    split = int(len(df) * 0.8)
+    test = df.iloc[split:]
+    X_test, y_test = test[feature_cols], test["label"]
+    y_proba = model.predict_proba(X_test)
+
+    n_classes = 3
+    fpr, tpr, roc_auc_vals = {}, {}, {}
+    for c in range(n_classes):
+        fpr[c], tpr[c], _ = roc_curve((y_test == c).astype(int), y_proba[:, c])
+        roc_auc_vals[c] = auc(fpr[c], tpr[c])
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    labels = ["Neutral", "Bearish", "Bullish"]
+    for c in range(n_classes):
+        ax.plot(fpr[c], tpr[c], label=f"{labels[c]} (AUC={roc_auc_vals[c]:.3f})", lw=1.5)
+    ax.plot([0, 1], [0, 1], "k--", lw=0.6)
+    ax.set_xlabel("FPR")
+    ax.set_ylabel("TPR")
+    ax.set_title(f"{symbol} – ROC Curves (Hybrid XGB)")
+    ax.legend(loc="lower right", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, f"{symbol}_roc_curves.png"), dpi=150)
+    plt.close(fig)
+
+
+def _save_shap(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    symbol: str,
+    output_dir: str,
+):
+    """Train a model on full train set and compute SHAP values."""
+    try:
+        import shap
+    except ImportError:
+        print("  shap not installed, skipping SHAP analysis.")
+        return
+
+    split = int(len(df) * 0.8)
+    train = df.iloc[:split]
+    X_train = train[feature_cols]
+    y_train = train["label"]
+
+    model = _xgb_model(n_classes=int(y_train.nunique()))
+    model.fit(X_train, y_train)
+
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_train.iloc[-200:])
+
+    # Mean absolute SHAP per feature (average across classes)
+    if isinstance(shap_values, list):
+        mean_shap = np.mean(
+            [np.abs(sv).mean(axis=0) for sv in shap_values], axis=0
+        )
+    else:
+        mean_shap = np.abs(shap_values).mean(axis=0)
+
+    importance_df = (
+        pd.DataFrame({"feature": feature_cols, "mean_abs_shap": mean_shap})
+        .sort_values("mean_abs_shap", ascending=False)
+    )
+    importance_df.to_csv(
+        os.path.join(output_dir, f"{symbol}_feature_importance.csv"), index=False
+    )
+
+    # Bar plot of top 20 features
+    top = importance_df.head(20)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.barh(top["feature"][::-1], top["mean_abs_shap"][::-1])
+    ax.set_xlabel("Mean |SHAP|")
+    ax.set_title(f"{symbol} – Top 20 Features by SHAP Importance")
+
+    # Highlight sentiment features
+    for i, feat in enumerate(top["feature"][::-1]):
+        if feat.startswith("sent_"):
+            ax.get_children()[i].set_color("orange")
+
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(output_dir, f"{symbol}_shap_importance.png"), dpi=150
+    )
+    plt.close(fig)
+    print(f"  SHAP analysis saved -> {output_dir}/{symbol}_shap_importance.png")
+
+
+def _save_comparison_table(results: dict, symbol: str, output_dir: str):
+    """Save a CSV comparing all configs side-by-side."""
+    rows = []
+    for config_name, data in results["configs"].items():
+        row = {"config": config_name, "n_features": data["n_features"]}
+        for k, v in data["train_test"].items():
+            row[f"tt_{k}"] = v
+        for k, v in data["walk_forward"].items():
+            row[f"wf_{k}"] = v
+        rows.append(row)
+    comp_df = pd.DataFrame(rows)
+    path = os.path.join(output_dir, f"{symbol}_comparison.csv")
+    comp_df.to_csv(path, index=False)
+    print(f"  Comparison table -> {path}")
+
+
+# ---------------------------------------------------------------------------
+# Run experiments for multiple tickers
+# ---------------------------------------------------------------------------
+
+def run_all_experiments(
+    tickers: list[str],
+    start: str = "2022-01-01",
+    end: str | None = None,
+    lookahead: int = 5,
+    thresh: float = 0.01,
+    n_splits: int = 5,
+    output_dir: str = "results",
+) -> dict[str, dict]:
+    """Run experiments for a list of tickers and return all results."""
+    all_results = {}
+    for ticker in tickers:
+        try:
+            all_results[ticker] = run_experiment(
+                ticker,
+                start=start,
+                end=end,
+                lookahead=lookahead,
+                thresh=thresh,
+                n_splits=n_splits,
+                output_dir=output_dir,
+            )
+        except Exception as e:
+            print(f"  ERROR with {ticker}: {e}")
+            all_results[ticker] = {"error": str(e)}
+
+    # Cross-ticker summary
+    _save_cross_ticker_summary(all_results, output_dir)
+    return all_results
+
+
+def _save_cross_ticker_summary(all_results: dict, output_dir: str):
+    rows = []
+    for symbol, res in all_results.items():
+        if "error" in res:
+            continue
+        for config_name, data in res.get("configs", {}).items():
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "config": config_name,
+                    "tt_accuracy": data["train_test"]["accuracy"],
+                    "tt_f1_macro": data["train_test"]["f1_macro"],
+                    "wf_accuracy_mean": data["walk_forward"]["accuracy_mean"],
+                    "wf_f1_macro_mean": data["walk_forward"]["f1_macro_mean"],
+                }
+            )
+    if rows:
+        summary = pd.DataFrame(rows)
+        path = os.path.join(output_dir, "cross_ticker_summary.csv")
+        summary.to_csv(path, index=False)
+        print(f"\nCross-ticker summary -> {path}")

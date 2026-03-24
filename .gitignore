@@ -6,8 +6,7 @@ venv
 __pycache__
 .DS_store
 
-**/*.ipynb*
-
 dataset/
+results/
 
-*.pkl
+*.html
