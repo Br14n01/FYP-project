@@ -22,6 +22,8 @@ from src.sentiment.sentiment_features import load_daily_sentiment
 # ---------------------------------------------------------------------------
 
 def _merge(df_main: pd.DataFrame, ta_obj) -> pd.DataFrame:
+    if ta_obj is None:
+        return df_main
     if isinstance(ta_obj, pd.DataFrame):
         return pd.concat([df_main, ta_obj], axis=1)
     return pd.concat([df_main, ta_obj.rename(ta_obj.name)], axis=1)
@@ -55,9 +57,15 @@ def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
     df = _merge(df, ta.kc(df["High"], df["Low"], df["Close"], length=20))
 
     # Volume
-    df["obv"] = ta.obv(df["Close"], df["Volume"])
-    df["ad"] = ta.ad(df["High"], df["Low"], df["Close"], df["Volume"])
-    df["efi"] = ta.efi(df["Close"], df["Volume"])
+    _obv = ta.obv(df["Close"], df["Volume"])
+    if _obv is not None:
+        df["obv"] = _obv
+    _ad = ta.ad(df["High"], df["Low"], df["Close"], df["Volume"])
+    if _ad is not None:
+        df["ad"] = _ad
+    _efi = ta.efi(df["Close"], df["Volume"])
+    if _efi is not None:
+        df["efi"] = _efi
     df = _merge(df, ta.nvi(df["Close"], df["Volume"]))
     df = _merge(df, ta.pvi(df["Close"], df["Volume"]))
 
