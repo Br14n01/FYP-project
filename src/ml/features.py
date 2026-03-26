@@ -58,8 +58,8 @@ def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
     df["obv"] = ta.obv(df["Close"], df["Volume"])
     df["ad"] = ta.ad(df["High"], df["Low"], df["Close"], df["Volume"])
     df["efi"] = ta.efi(df["Close"], df["Volume"])
-    df["nvi"] = ta.nvi(df["Close"], df["Volume"])
-    df["pvi"] = ta.pvi(df["Close"], df["Volume"])
+    df = _merge(df, ta.nvi(df["Close"], df["Volume"]))
+    df = _merge(df, ta.pvi(df["Close"], df["Volume"]))
 
     return df
 
