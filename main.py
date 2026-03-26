@@ -401,6 +401,10 @@ def live_demo():
 
     signal_map = {0: "NEUTRAL (Hold)", 1: "BEARISH (Sell)", 2: "BULLISH (Buy)"}
     signal = signal_map.get(prediction, f"Unknown ({prediction})")
+    proba_map = {cls: prob for cls, prob in zip(model.classes_, probabilities)}
+    neutral_proba = proba_map.get(0, 0.0)
+    bearish_proba = proba_map.get(1, 0.0)
+    bullish_proba = proba_map.get(2, 0.0)
 
     print(f"\n{'='*60}")
     print(f"  LIVE SIGNAL for {ticker}")
@@ -409,9 +413,9 @@ def live_demo():
     print(f"{'='*60}")
     print(f"\n  >>> Signal: {signal}")
     print(f"\n  Class probabilities:")
-    print(f"    Neutral : {probabilities[0]:.4f}")
-    print(f"    Bearish : {probabilities[1]:.4f}")
-    print(f"    Bullish : {probabilities[2]:.4f}")
+    print(f"    Neutral : {neutral_proba:.4f}")
+    print(f"    Bearish : {bearish_proba:.4f}")
+    print(f"    Bullish : {bullish_proba:.4f}")
     print(f"    Confidence: {max(probabilities):.2%}")
     print()
 
