@@ -9,6 +9,7 @@ Usage:
 
 import os
 import json
+import pickle
 import warnings
 
 import numpy as np
@@ -488,3 +489,126 @@ def _save_cross_ticker_summary(all_results: dict, output_dir: str):
         path = os.path.join(output_dir, "cross_ticker_summary.csv")
         summary.to_csv(path, index=False)
         print(f"\nCross-ticker summary -> {path}")
+
+
+# ---------------------------------------------------------------------------
+# Model persistence (pretrain / save / load)
+# ---------------------------------------------------------------------------
+
+MODELS_DIR = "models"
+
+
+def pretrain_and_save(
+    symbol: str,
+    start: str = "2022-01-01",
+    end: str | None = None,
+    lookahead: int = 5,
+    thresh: float = 0.01,
+    include_sentiment: bool = True,
+    models_dir: str = MODELS_DIR,
+) -> dict:
+    """
+    Train a hybrid XGBoost model on all available data for a ticker
+    and persist it to disk.
+
+    Saves to models/{symbol}_model.pkl containing:
+      - model: the trained XGBClassifier
+      - feature_columns: list of feature names (in order)
+      - include_sentiment: whether sentiment features were used
+      - metadata: symbol, date range, lookahead, threshold, train size
+    """
+    os.makedirs(models_dir, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"  PRE-TRAINING: {symbol}")
+    print(f"{'='*60}")
+
+    df = build_feature_matrix(
+        symbol,
+        start=start,
+        end=end,
+        lookahead=lookahead,
+        thresh=thresh,
+        include_sentiment=include_sentiment,
+    )
+
+    feature_cols = get_feature_columns(df, include_sentiment=include_sentiment)
+    X = df[feature_cols]
+    y = df["label"]
+
+    n_classes = int(y.nunique())
+    model = _xgb_model(n_classes=n_classes)
+
+    print(f"  Training on {len(X)} samples, {len(feature_cols)} features ...")
+    model.fit(X, y)
+
+    # Evaluate on last 20% for reference
+    split = int(len(df) * 0.8)
+    y_pred = model.predict(df.iloc[split:][feature_cols])
+    y_true = df.iloc[split:]["label"]
+    acc = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, average="macro")
+    print(f"  Holdout accuracy: {acc:.4f}  F1-macro: {f1:.4f}")
+
+    # Retrain on ALL data for the production model
+    model_final = _xgb_model(n_classes=n_classes)
+    model_final.fit(X, y)
+
+    bundle = {
+        "model": model_final,
+        "feature_columns": feature_cols,
+        "include_sentiment": include_sentiment,
+        "metadata": {
+            "symbol": symbol,
+            "start": start,
+            "end": end or "latest",
+            "lookahead": lookahead,
+            "threshold": thresh,
+            "n_samples": len(X),
+            "n_features": len(feature_cols),
+            "holdout_accuracy": acc,
+            "holdout_f1_macro": f1,
+        },
+    }
+
+    path = os.path.join(models_dir, f"{symbol}_model.pkl")
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+    print(f"  Model saved -> {path}")
+
+    return bundle
+
+
+def load_pretrained(symbol: str, models_dir: str = MODELS_DIR) -> dict:
+    """
+    Load a pretrained model bundle from disk.
+
+    Returns dict with keys: model, feature_columns, include_sentiment, metadata.
+    """
+    path = os.path.join(models_dir, f"{symbol}_model.pkl")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No pretrained model for {symbol}. Run pretrain first."
+        )
+    with open(path, "rb") as f:
+        bundle = pickle.load(f)
+    print(f"  Loaded pretrained model for {bundle['metadata']['symbol']}")
+    print(f"  Trained on {bundle['metadata']['n_samples']} samples, "
+          f"{bundle['metadata']['n_features']} features")
+    return bundle
+
+
+def pretrain_multiple(
+    tickers: list[str],
+    start: str = "2022-01-01",
+    end: str | None = None,
+    include_sentiment: bool = True,
+):
+    """Pretrain and save models for multiple tickers."""
+    for ticker in tickers:
+        try:
+            pretrain_and_save(
+                ticker, start=start, end=end, include_sentiment=include_sentiment
+            )
+        except Exception as e:
+            print(f"  ERROR pre-training {ticker}: {e}")
