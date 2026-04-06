@@ -321,7 +321,9 @@ def _save_confusion_matrix(
     ax.set_ylabel("True")
     ax.set_title(f"{symbol} – Normalised Confusion Matrix (Hybrid XGB)")
     fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, f"{symbol}_confusion_matrix.png"), dpi=150)
+    chart_dir = os.path.join(output_dir, "chart")
+    os.makedirs(chart_dir, exist_ok=True)
+    fig.savefig(os.path.join(chart_dir, f"{symbol}_confusion_matrix.png"), dpi=150)
     plt.close(fig)
 
 
@@ -353,7 +355,9 @@ def _save_roc_curves(
     ax.set_title(f"{symbol} – ROC Curves (Hybrid XGB)")
     ax.legend(loc="lower right", fontsize=9)
     fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, f"{symbol}_roc_curves.png"), dpi=150)
+    chart_dir = os.path.join(output_dir, "chart")
+    os.makedirs(chart_dir, exist_ok=True)
+    fig.savefig(os.path.join(chart_dir, f"{symbol}_roc_curves.png"), dpi=150)
     plt.close(fig)
 
 
@@ -410,11 +414,13 @@ def _save_shap(
             ax.get_children()[i].set_color("orange")
 
     fig.tight_layout()
+    chart_dir = os.path.join(output_dir, "chart")
+    os.makedirs(chart_dir, exist_ok=True)
     fig.savefig(
-        os.path.join(output_dir, f"{symbol}_shap_importance.png"), dpi=150
+        os.path.join(chart_dir, f"{symbol}_shap_importance.png"), dpi=150
     )
     plt.close(fig)
-    print(f"  SHAP analysis saved -> {output_dir}/{symbol}_shap_importance.png")
+    print(f"  SHAP analysis saved -> {chart_dir}/{symbol}_shap_importance.png")
 
 
 def _save_comparison_table(results: dict, symbol: str, output_dir: str):
@@ -537,21 +543,24 @@ def pretrain_and_save(
     y = df["label"]
 
     n_classes = int(y.nunique())
-    model = _xgb_model(n_classes=n_classes)
 
-    print(f"  Training on {len(X)} samples, {len(feature_cols)} features ...")
-    model.fit(X, y)
-
-    # Evaluate on last 20% for reference
+    # Evaluate on last 20% using a model trained on first 80% only
     split = int(len(df) * 0.8)
-    y_pred = model.predict(df.iloc[split:][feature_cols])
-    y_true = df.iloc[split:]["label"]
-    acc = accuracy_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred, average="macro")
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+    eval_model = _xgb_model(n_classes=n_classes)
+    print(f"  Evaluating: train on {len(X_train)} samples, test on {len(X_test)} samples ...")
+    eval_model.fit(X_train, y_train)
+
+    y_pred = eval_model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, average="macro")
     print(f"  Holdout accuracy: {acc:.4f}  F1-macro: {f1:.4f}")
 
-    # Retrain on ALL data for the production model
+    # Train final production model on ALL data
     model_final = _xgb_model(n_classes=n_classes)
+    print(f"  Retraining on all {len(X)} samples for production model ...")
     model_final.fit(X, y)
 
     bundle = {

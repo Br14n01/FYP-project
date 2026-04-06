@@ -446,7 +446,9 @@ def _plot_capital(
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    path = os.path.join(output_dir, f"sim_{model_ticker}_on_{test_ticker}_chart.png")
+    chart_dir = os.path.join(output_dir, "chart")
+    os.makedirs(chart_dir, exist_ok=True)
+    path = os.path.join(chart_dir, f"sim_{model_ticker}_on_{test_ticker}_chart.png")
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  Chart saved -> {path}")
