@@ -8,7 +8,8 @@ Menu:
   4. Run full pipeline (collect -> score -> train -> evaluate -> backtest)
   5. Run experiment only (train + evaluate, assumes data already collected)
   6. Pretrain models (train and save to disk for live demo)
-  7. Live trading demo (fetch today's data, predict signal)
+  7. Live trading demo (predict today's signal)
+  8. Backtest simulation (day-by-day trading simulation with evaluation)
 """
 
 from dotenv import load_dotenv
@@ -420,6 +421,54 @@ def live_demo():
     print()
 
 
+def backtest_simulation():
+    """
+    Day-by-day trading simulation using a pretrained model.
+
+    Tests model generalization by training on one ticker and simulating
+    trading on multiple tickers. Produces evaluation charts and metrics.
+    """
+    from src.ml.simulation import run_generalization_test
+
+    models_dir = "models"
+    if not os.path.exists(models_dir):
+        print("No pretrained models found. Run option 6 first.")
+        return
+
+    available = [f.replace("_model.pkl", "") for f in os.listdir(models_dir) if f.endswith("_model.pkl")]
+    if not available:
+        print("No pretrained models found. Run option 6 first.")
+        return
+
+    print(f"Available pretrained models: {', '.join(available)}")
+    model_ticker = input("Model ticker to use (default VOO): ").strip().upper() or "VOO"
+
+    if model_ticker not in available:
+        print(f"No pretrained model for {model_ticker}. Available: {', '.join(available)}")
+        return
+
+    test_input = input("Test tickers (comma-separated, default VOO,GOOG,JPM): ").strip()
+    test_tickers = (
+        [t.strip().upper() for t in test_input.split(",")]
+        if test_input
+        else ["VOO", "GOOG", "JPM"]
+    )
+
+    sim_start = input("Simulation start date (default 2026-03-01): ").strip() or "2026-03-01"
+    sim_end = input("Simulation end date (default 2026-04-01): ").strip() or "2026-04-01"
+
+    capital_str = input("Initial capital in USD (default 10000): ").strip() or "10000"
+    initial_capital = float(capital_str)
+
+    run_generalization_test(
+        model_ticker=model_ticker,
+        test_tickers=test_tickers,
+        sim_start=sim_start,
+        sim_end=sim_end,
+        initial_capital=initial_capital,
+    )
+
+
 def main():
     print("\n=== Hybrid Sentiment + Technical Trading System ===\n")
     print("1 = Sentiment analysis (live news demo)")
@@ -429,6 +478,7 @@ def main():
     print("5 = Run experiment only (assumes data collected)")
     print("6 = Pretrain models (VOO, GOOGL, JPM)")
     print("7 = Live trading demo (predict today's signal)")
+    print("8 = Backtest simulation (generalization test)")
     print()
 
     action = int(input("Enter action: "))
@@ -446,6 +496,8 @@ def main():
         pretrain_models()
     elif action == 7:
         live_demo()
+    elif action == 8:
+        backtest_simulation()
     else:
         print("Invalid action.")
 
