@@ -19,8 +19,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from src.ml.features import download_price_data, add_indicators, SENTIMENT_FEATURE_COLS
-from src.ml.train import load_pretrained
+from src.ml.features import (
+    download_price_data,
+    add_indicators,
+    add_relative_indicators,
+    SENTIMENT_FEATURE_COLS,
+)
+from src.ml.train import load_pretrained, load_universal_model
 from src.sentiment.news_sentimental_analysis import SentimentScorer
 from src.sentiment.finnhub_news import fetch_historical_news
 
@@ -75,6 +80,7 @@ def run_simulation(
     initial_capital: float = 10_000.0,
     articles_per_day: int = 5,
     output_dir: str = "results",
+    use_universal: bool = False,
 ) -> dict:
     """
     Run a day-by-day trading simulation.
@@ -83,6 +89,7 @@ def run_simulation(
     ----------
     model_ticker : str
         Ticker whose pretrained model to load (e.g. "VOO").
+        Ignored when ``use_universal=True``.
     test_ticker : str
         Ticker to trade during the simulation (e.g. "JPM").
     sim_start : str
@@ -95,6 +102,9 @@ def run_simulation(
         Number of news articles to fetch per day.
     output_dir : str
         Where to save results.
+    use_universal : bool
+        If True, load the universal cross-stock model instead of a
+        per-ticker pretrained model.
 
     Returns
     -------
@@ -102,17 +112,22 @@ def run_simulation(
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    model_label = "universal" if use_universal else model_ticker
+
     print(f"\n{'='*60}")
-    print(f"  SIMULATION: model={model_ticker}, trading={test_ticker}")
+    print(f"  SIMULATION: model={model_label}, trading={test_ticker}")
     print(f"  Period: {sim_start} -> {sim_end}")
     print(f"  Capital: ${initial_capital:,.2f}")
     print(f"{'='*60}")
 
-    # Load pretrained model
-    bundle = load_pretrained(model_ticker)
+    # Load model
+    if use_universal:
+        bundle = load_universal_model()
+    else:
+        bundle = load_pretrained(model_ticker)
     model = bundle["model"]
     feature_cols = bundle["feature_columns"]
-    include_sentiment = bundle["include_sentiment"]
+    include_sentiment = bundle.get("include_sentiment", False)
 
     # Download price data with enough lookback for indicators
     lookback_start = (datetime.strptime(sim_start, "%Y-%m-%d") - timedelta(days=120)).strftime("%Y-%m-%d")
@@ -125,13 +140,18 @@ def run_simulation(
         print("  ERROR: No price data available.")
         return {"error": "No price data"}
 
-    # Pre-fetch all news for the simulation period
-    print(f"  Pre-fetching news for {test_ticker} ({sim_start} -> {sim_end}) ...")
-    news_df = fetch_historical_news(test_ticker, sim_start, sim_end, save=False, rate_limit_pause=0.5)
+    # Pre-fetch news if model uses sentiment
+    if include_sentiment:
+        print(f"  Pre-fetching news for {test_ticker} ({sim_start} -> {sim_end}) ...")
+        news_df = fetch_historical_news(test_ticker, sim_start, sim_end, save=False, rate_limit_pause=0.5)
+    else:
+        news_df = pd.DataFrame()
 
     # Compute indicators on full price history
     print("  Computing technical indicators ...")
     df_ta = add_indicators(price_df)
+    if use_universal:
+        df_ta = add_relative_indicators(df_ta)
     df_ta.dropna(inplace=True)
     df_ta.index = pd.to_datetime(df_ta.index)
     if df_ta.index.tz is not None:
@@ -162,21 +182,23 @@ def run_simulation(
         close_price = float(df_ta.loc[day, "Close"])
         is_last_day = (i == len(trading_days) - 1) or (day >= sim_end_dt)
 
-        # Fetch sentiment for the day
-        articles = _get_news_by_date(news_df, day_str, max_articles=articles_per_day)
-        sent_features = _compute_daily_sentiment(articles)
-        sentiment_history.append(sent_features)
+        # Fetch and compute sentiment if the model uses it
+        sent_features = {col: 0.0 for col in SENTIMENT_FEATURE_COLS}
+        articles = []
+        if include_sentiment:
+            articles = _get_news_by_date(news_df, day_str, max_articles=articles_per_day)
+            sent_features = _compute_daily_sentiment(articles)
+            sentiment_history.append(sent_features)
 
-        # Rolling sentiment momentum from history
-        if len(sentiment_history) >= 3:
-            sent_features["sent_momentum_3d"] = np.mean([s["sent_mean"] for s in sentiment_history[-3:]])
-        if len(sentiment_history) >= 5:
-            sent_features["sent_momentum_5d"] = np.mean([s["sent_mean"] for s in sentiment_history[-5:]])
-        if len(sentiment_history) >= 10:
-            sent_features["sent_momentum_10d"] = np.mean([s["sent_mean"] for s in sentiment_history[-10:]])
-        if len(sentiment_history) >= 5:
-            recent_means = [s["sent_mean"] for s in sentiment_history[-5:]]
-            sent_features["sent_vol_5d"] = float(np.std(recent_means))
+            if len(sentiment_history) >= 3:
+                sent_features["sent_momentum_3d"] = np.mean([s["sent_mean"] for s in sentiment_history[-3:]])
+            if len(sentiment_history) >= 5:
+                sent_features["sent_momentum_5d"] = np.mean([s["sent_mean"] for s in sentiment_history[-5:]])
+            if len(sentiment_history) >= 10:
+                sent_features["sent_momentum_10d"] = np.mean([s["sent_mean"] for s in sentiment_history[-10:]])
+            if len(sentiment_history) >= 5:
+                recent_means = [s["sent_mean"] for s in sentiment_history[-5:]]
+                sent_features["sent_vol_5d"] = float(np.std(recent_means))
 
         # Build feature vector for this day
         today_row = df_ta.loc[[day]].copy()
@@ -262,11 +284,11 @@ def run_simulation(
     metrics = _compute_metrics(log_df, initial_capital, trades)
 
     # Print summary
-    _print_summary(model_ticker, test_ticker, sim_start, sim_end, metrics, trades)
+    _print_summary(model_label, test_ticker, sim_start, sim_end, metrics, trades)
 
     # Save outputs
-    _save_results(log_df, metrics, trades, model_ticker, test_ticker, output_dir)
-    _plot_capital(log_df, model_ticker, test_ticker, initial_capital, metrics, output_dir)
+    _save_results(log_df, metrics, trades, model_label, test_ticker, output_dir)
+    _plot_capital(log_df, model_label, test_ticker, initial_capital, metrics, output_dir)
 
     return {"daily_log": log_df, "metrics": metrics, "trades": trades}
 
@@ -461,21 +483,26 @@ def run_generalization_test(
     sim_end: str = "2026-04-01",
     initial_capital: float = 10_000.0,
     output_dir: str = "results",
+    use_universal: bool = False,
 ) -> dict[str, dict]:
     """
-    Test whether a model trained on one ticker generalizes to others.
+    Test whether a model generalizes to multiple tickers.
 
-    Runs the simulation on each test ticker using the same pretrained model,
-    then produces a comparison summary.
+    Parameters
+    ----------
+    use_universal : bool
+        If True, use the universal cross-stock model instead of a
+        per-ticker pretrained model.
     """
     if test_tickers is None:
         test_tickers = ["VOO", "GOOG", "JPM"]
 
+    model_label = "universal" if use_universal else model_ticker
     all_results = {}
 
     for ticker in test_tickers:
         print(f"\n{'#'*60}")
-        print(f"  GENERALIZATION TEST: {model_ticker} model -> {ticker}")
+        print(f"  GENERALIZATION TEST: {model_label} model -> {ticker}")
         print(f"{'#'*60}")
         try:
             result = run_simulation(
@@ -485,6 +512,7 @@ def run_generalization_test(
                 sim_end=sim_end,
                 initial_capital=initial_capital,
                 output_dir=output_dir,
+                use_universal=use_universal,
             )
             all_results[ticker] = result.get("metrics", {})
         except Exception as e:
@@ -492,7 +520,7 @@ def run_generalization_test(
             all_results[ticker] = {"error": str(e)}
 
     # Comparison table
-    _save_generalization_summary(model_ticker, all_results, output_dir)
+    _save_generalization_summary(model_label, all_results, output_dir)
     return all_results
 
 

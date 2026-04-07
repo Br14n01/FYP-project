@@ -63,6 +63,19 @@ def _xgb_model(n_classes: int = 3) -> XGBClassifier:
     )
 
 
+def _xgb_model_with_params(params: dict, n_classes: int = 3) -> XGBClassifier:
+    """Build an XGBClassifier from an arbitrary parameter dict."""
+    defaults = {
+        "objective": "multi:softprob",
+        "num_class": n_classes,
+        "n_jobs": -1,
+        "eval_metric": "mlogloss",
+        "random_state": 42,
+    }
+    merged = {**defaults, **params}
+    return XGBClassifier(**merged)
+
+
 def _rf_model() -> RandomForestClassifier:
     return RandomForestClassifier(
         n_estimators=300,
@@ -71,6 +84,114 @@ def _rf_model() -> RandomForestClassifier:
         n_jobs=-1,
         random_state=42,
     )
+
+
+# ---------------------------------------------------------------------------
+# Purged time-series cross-validation
+# ---------------------------------------------------------------------------
+
+class PurgedTimeSeriesSplit:
+    """
+    TimeSeriesSplit with a purge gap between train and test to avoid
+    lookahead leakage from rolling-window labels.
+    """
+
+    def __init__(self, n_splits: int = 5, purge_gap: int = 10):
+        self.n_splits = n_splits
+        self.purge_gap = purge_gap
+
+    def split(self, X, y=None, groups=None):
+        n = len(X)
+        fold_size = n // (self.n_splits + 1)
+        for i in range(1, self.n_splits + 1):
+            train_end = fold_size * i
+            test_start = train_end + self.purge_gap
+            test_end = test_start + fold_size
+            if test_end > n:
+                test_end = n
+            if test_start >= n:
+                break
+            train_idx = list(range(0, train_end))
+            test_idx = list(range(test_start, test_end))
+            if len(test_idx) == 0:
+                continue
+            yield train_idx, test_idx
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return self.n_splits
+
+
+# ---------------------------------------------------------------------------
+# Optuna hyperparameter tuning
+# ---------------------------------------------------------------------------
+
+def tune_hyperparameters(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    label_col: str = "label",
+    n_trials: int = 50,
+    n_splits: int = 5,
+    purge_gap: int = 10,
+    timeout: int | None = 600,
+) -> dict:
+    """
+    Bayesian hyperparameter search for XGBoost using Optuna with
+    purged time-series cross-validation and early stopping.
+
+    Returns the best parameter dict.
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    X = df[feature_cols]
+    y = df[label_col]
+    n_classes = int(y.nunique())
+    cv = PurgedTimeSeriesSplit(n_splits=n_splits, purge_gap=purge_gap)
+
+    def objective(trial: optuna.Trial) -> float:
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 1000, step=50),
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+            "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+        }
+
+        f1_scores = []
+        for train_idx, test_idx in cv.split(X):
+            X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
+            y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
+
+            # Hold out the last 10% of training data for early stopping
+            es_split = int(len(X_tr) * 0.9)
+            X_tr_fit, X_tr_es = X_tr.iloc[:es_split], X_tr.iloc[es_split:]
+            y_tr_fit, y_tr_es = y_tr.iloc[:es_split], y_tr.iloc[es_split:]
+
+            model = _xgb_model_with_params(params, n_classes=n_classes)
+            model.set_params(early_stopping_rounds=30)
+            model.fit(
+                X_tr_fit, y_tr_fit,
+                eval_set=[(X_tr_es, y_tr_es)],
+                verbose=False,
+            )
+
+            y_pred = model.predict(X_te)
+            f1_scores.append(f1_score(y_te, y_pred, average="macro"))
+
+        return float(np.mean(f1_scores))
+
+    study = optuna.create_study(direction="maximize", study_name="xgb_tuning")
+    study.optimize(objective, n_trials=n_trials, timeout=timeout)
+
+    print(f"\n  Optuna tuning complete: {len(study.trials)} trials")
+    print(f"  Best F1-macro: {study.best_value:.4f}")
+    print(f"  Best params: {study.best_params}")
+
+    return study.best_params
 
 
 # ---------------------------------------------------------------------------
@@ -83,13 +204,23 @@ def walk_forward_validate(
     label_col: str = "label",
     model_type: str = "xgboost",
     n_splits: int = 5,
+    purge_gap: int = 0,
 ) -> tuple[pd.DataFrame, object]:
     """
     Time-series walk-forward cross-validation.
 
+    Parameters
+    ----------
+    purge_gap : int
+        Number of rows to drop between train and test folds to avoid
+        lookahead leakage from rolling-window labels.  0 = no purge.
+
     Returns (metrics_df, last_trained_model).
     """
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+    if purge_gap > 0:
+        tscv = PurgedTimeSeriesSplit(n_splits=n_splits, purge_gap=purge_gap)
+    else:
+        tscv = TimeSeriesSplit(n_splits=n_splits)
     fold_metrics = []
     model = None
 
@@ -621,3 +752,387 @@ def pretrain_multiple(
             )
         except Exception as e:
             print(f"  ERROR pre-training {ticker}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Universal (cross-stock) model training
+# ---------------------------------------------------------------------------
+
+def train_universal_model(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    label_col: str = "label",
+    train_end: str = "2023-12-31",
+    val_end: str | None = "2024-06-30",
+    xgb_params: dict | None = None,
+    tune: bool = False,
+    tune_trials: int = 50,
+    models_dir: str = MODELS_DIR,
+) -> dict:
+    """
+    Train a single XGBoost model on pooled multi-stock data.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Output of ``build_universal_dataset()`` — must contain ``ticker``,
+        ``sector_id``, ``label``, and all feature columns.
+    feature_cols : list[str]
+        Column names to use as features (should exclude OHLCV, label, ticker).
+    train_end / val_end : str
+        Date boundaries for temporal train / val / test split.
+    xgb_params : dict or None
+        Pre-tuned XGBoost params.  If None, defaults are used (or tuned).
+    tune : bool
+        If True, run Optuna hyperparameter search on the training fold.
+    models_dir : str
+        Directory to save the model bundle.
+
+    Returns
+    -------
+    dict  – bundle with model, feature_columns, metadata, and evaluation
+    """
+    from src.ml.universe import temporal_train_test_split
+
+    os.makedirs(models_dir, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"  TRAINING UNIVERSAL MODEL")
+    print(f"{'='*60}")
+
+    if val_end:
+        train_df, val_df, test_df = temporal_train_test_split(df, train_end, val_end)
+    else:
+        train_df, test_df = temporal_train_test_split(df, train_end)
+        val_df = None
+
+    X_train = train_df[feature_cols]
+    y_train = train_df[label_col]
+    X_test = test_df[feature_cols]
+    y_test = test_df[label_col]
+
+    n_classes = int(y_train.nunique())
+
+    print(f"  Train: {len(train_df)} rows")
+    if val_df is not None:
+        print(f"  Val:   {len(val_df)} rows")
+    print(f"  Test:  {len(test_df)} rows")
+    print(f"  Features: {len(feature_cols)}")
+
+    # Optional hyperparameter tuning on training fold
+    if tune:
+        print("\n  Running Optuna hyperparameter search ...")
+        xgb_params = tune_hyperparameters(
+            train_df, feature_cols, label_col=label_col, n_trials=tune_trials,
+        )
+
+    if xgb_params:
+        model = _xgb_model_with_params(xgb_params, n_classes=n_classes)
+    else:
+        model = _xgb_model(n_classes=n_classes)
+
+    # Early stopping using validation set
+    if val_df is not None and len(val_df) > 0:
+        X_val = val_df[feature_cols]
+        y_val = val_df[label_col]
+        model.set_params(early_stopping_rounds=30)
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
+        )
+    else:
+        model.fit(X_train, y_train)
+
+    # Evaluate on test set
+    y_pred = model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, average="macro")
+    prec = precision_score(y_test, y_pred, average="macro", zero_division=0)
+    rec = recall_score(y_test, y_pred, average="macro", zero_division=0)
+
+    print(f"\n  Test results:")
+    print(f"    Accuracy:  {acc:.4f}")
+    print(f"    F1-macro:  {f1:.4f}")
+    print(f"    Precision: {prec:.4f}")
+    print(f"    Recall:    {rec:.4f}")
+
+    # Per-sector breakdown
+    sector_metrics = _compute_sector_metrics(test_df, feature_cols, model, label_col)
+
+    # Detect whether sentiment features are in the feature set
+    include_sentiment = any(c.startswith("sent_") for c in feature_cols)
+
+    bundle = {
+        "model": model,
+        "feature_columns": feature_cols,
+        "model_type": "universal",
+        "include_sentiment": include_sentiment,
+        "xgb_params": xgb_params,
+        "metadata": {
+            "train_end": train_end,
+            "val_end": val_end,
+            "n_train": len(train_df),
+            "n_test": len(test_df),
+            "n_features": len(feature_cols),
+            "test_accuracy": acc,
+            "test_f1_macro": f1,
+            "sector_metrics": sector_metrics,
+        },
+    }
+
+    path = os.path.join(models_dir, "universal_model.pkl")
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+    print(f"\n  Universal model saved -> {path}")
+
+    return bundle
+
+
+def finetune_for_sector(
+    base_bundle: dict,
+    df: pd.DataFrame,
+    sector_id: int,
+    feature_cols: list[str],
+    label_col: str = "label",
+    n_extra_rounds: int = 50,
+    models_dir: str = MODELS_DIR,
+) -> dict:
+    """
+    Fine-tune a universal base model on data from a single sector using
+    XGBoost warm-start (``xgb_model`` parameter of fit).
+
+    Parameters
+    ----------
+    base_bundle : dict
+        Bundle returned by ``train_universal_model()``.
+    sector_id : int
+        Integer sector id to filter on.
+    n_extra_rounds : int
+        How many additional boosting rounds to run on sector data.
+    """
+    os.makedirs(models_dir, exist_ok=True)
+
+    sector_df = df[df["sector_id"] == sector_id].copy()
+    if sector_df.empty:
+        raise ValueError(f"No data for sector_id={sector_id}")
+
+    X_sector = sector_df[feature_cols]
+    y_sector = sector_df[label_col]
+
+    base_model = base_bundle["model"]
+    n_classes = len(base_model.classes_)
+
+    # Build a new model that warm-starts from the base model's booster
+    ft_model = XGBClassifier(
+        n_estimators=n_extra_rounds,
+        learning_rate=0.01,
+        max_depth=base_model.get_params().get("max_depth", 6),
+        subsample=base_model.get_params().get("subsample", 0.9),
+        colsample_bytree=base_model.get_params().get("colsample_bytree", 0.8),
+        objective="multi:softprob",
+        num_class=n_classes,
+        n_jobs=-1,
+        eval_metric="mlogloss",
+        random_state=42,
+    )
+    ft_model.fit(X_sector, y_sector, xgb_model=base_model.get_booster())
+
+    # Evaluate on the sector data (in-sample, but useful for sanity check)
+    y_pred = ft_model.predict(X_sector)
+    acc = accuracy_score(y_sector, y_pred)
+    f1 = f1_score(y_sector, y_pred, average="macro")
+    print(f"  Sector {sector_id} fine-tune: acc={acc:.4f}  F1={f1:.4f} ({len(sector_df)} rows)")
+
+    bundle = {
+        "model": ft_model,
+        "feature_columns": feature_cols,
+        "model_type": "sector_finetuned",
+        "metadata": {
+            "sector_id": sector_id,
+            "n_samples": len(sector_df),
+            "n_extra_rounds": n_extra_rounds,
+            "sector_accuracy": acc,
+            "sector_f1_macro": f1,
+        },
+    }
+
+    path = os.path.join(models_dir, f"sector_{sector_id}_model.pkl")
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+    print(f"  Fine-tuned model saved -> {path}")
+
+    return bundle
+
+
+def finetune_all_sectors(
+    base_bundle: dict,
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    label_col: str = "label",
+    n_extra_rounds: int = 50,
+    models_dir: str = MODELS_DIR,
+) -> dict[int, dict]:
+    """Fine-tune the base model for every sector present in the data."""
+    results = {}
+    sector_ids = sorted(df["sector_id"].unique())
+
+    print(f"\n{'='*60}")
+    print(f"  SECTOR FINE-TUNING ({len(sector_ids)} sectors)")
+    print(f"{'='*60}")
+
+    for sid in sector_ids:
+        if sid < 0:
+            continue
+        try:
+            results[sid] = finetune_for_sector(
+                base_bundle, df, sid, feature_cols,
+                label_col=label_col, n_extra_rounds=n_extra_rounds,
+                models_dir=models_dir,
+            )
+        except Exception as e:
+            print(f"  ERROR sector {sid}: {e}")
+            results[sid] = {"error": str(e)}
+    return results
+
+
+def finetune_with_sentiment(
+    base_bundle: dict,
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    sentiment_start: str,
+    label_col: str = "label",
+    n_extra_rounds: int = 100,
+    models_dir: str = MODELS_DIR,
+) -> dict:
+    """
+    Phase 2 of two-phase training: warm-start the base universal model
+    on recent data where sentiment features are available.
+
+    The base model was trained with sentiment columns present but zeroed
+    out.  This fine-tune step adds trees that can split on real sentiment
+    values from the recent window.
+
+    Parameters
+    ----------
+    base_bundle : dict
+        Bundle from ``train_universal_model()`` (Phase 1).
+    df : pd.DataFrame
+        Full dataset (must include sentiment columns).
+    sentiment_start : str
+        Date from which sentiment data is available.  Only rows on or
+        after this date are used for fine-tuning.
+    n_extra_rounds : int
+        Additional boosting rounds on the sentiment-rich data.
+    """
+    os.makedirs(models_dir, exist_ok=True)
+
+    recent = df[df.index >= pd.Timestamp(sentiment_start)].copy()
+    if recent.empty:
+        raise ValueError(f"No data on or after {sentiment_start}")
+
+    X_recent = recent[feature_cols]
+    y_recent = recent[label_col]
+
+    base_model = base_bundle["model"]
+    n_classes = len(base_model.classes_)
+
+    print(f"\n{'='*60}")
+    print(f"  PHASE 2: SENTIMENT FINE-TUNING")
+    print(f"  Data from {sentiment_start}: {len(recent)} rows")
+    print(f"  Extra boosting rounds: {n_extra_rounds}")
+    print(f"{'='*60}")
+
+    ft_model = XGBClassifier(
+        n_estimators=n_extra_rounds,
+        learning_rate=0.01,
+        max_depth=base_model.get_params().get("max_depth", 6),
+        subsample=base_model.get_params().get("subsample", 0.9),
+        colsample_bytree=base_model.get_params().get("colsample_bytree", 0.8),
+        objective="multi:softprob",
+        num_class=n_classes,
+        n_jobs=-1,
+        eval_metric="mlogloss",
+        random_state=42,
+    )
+    ft_model.fit(X_recent, y_recent, xgb_model=base_model.get_booster())
+
+    y_pred = ft_model.predict(X_recent)
+    acc = accuracy_score(y_recent, y_pred)
+    f1 = f1_score(y_recent, y_pred, average="macro")
+    print(f"\n  In-sample results (sentiment window):")
+    print(f"    Accuracy: {acc:.4f}  F1-macro: {f1:.4f}")
+
+    bundle = {
+        "model": ft_model,
+        "feature_columns": feature_cols,
+        "model_type": "universal",
+        "include_sentiment": True,
+        "xgb_params": base_bundle.get("xgb_params"),
+        "metadata": {
+            **base_bundle["metadata"],
+            "sentiment_finetuned": True,
+            "sentiment_start": sentiment_start,
+            "n_sentiment_samples": len(recent),
+            "n_extra_rounds": n_extra_rounds,
+            "sentiment_ft_accuracy": acc,
+            "sentiment_ft_f1_macro": f1,
+        },
+    }
+
+    path = os.path.join(models_dir, "universal_model.pkl")
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+    print(f"  Sentiment-tuned universal model saved -> {path}")
+
+    return bundle
+
+
+def _compute_sector_metrics(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    model,
+    label_col: str = "label",
+) -> dict:
+    """Compute per-sector accuracy and F1 on a test DataFrame."""
+    metrics = {}
+    if "sector_id" not in df.columns:
+        return metrics
+
+    for sid in sorted(df["sector_id"].unique()):
+        if sid < 0:
+            continue
+        sub = df[df["sector_id"] == sid]
+        if len(sub) < 10:
+            continue
+        y_true = sub[label_col]
+        y_pred = model.predict(sub[feature_cols])
+        metrics[int(sid)] = {
+            "accuracy": float(accuracy_score(y_true, y_pred)),
+            "f1_macro": float(f1_score(y_true, y_pred, average="macro")),
+            "n_samples": len(sub),
+        }
+    return metrics
+
+
+def load_universal_model(models_dir: str = MODELS_DIR) -> dict:
+    """Load the universal model bundle."""
+    path = os.path.join(models_dir, "universal_model.pkl")
+    if not os.path.exists(path):
+        raise FileNotFoundError("No universal model found. Train one first.")
+    with open(path, "rb") as f:
+        bundle = pickle.load(f)
+    meta = bundle["metadata"]
+    print(f"  Loaded universal model: {meta['n_features']} features, "
+          f"trained on {meta['n_train']} samples")
+    return bundle
+
+
+def load_sector_model(sector_id: int, models_dir: str = MODELS_DIR) -> dict:
+    """Load a sector-fine-tuned model bundle."""
+    path = os.path.join(models_dir, f"sector_{sector_id}_model.pkl")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No fine-tuned model for sector {sector_id}.")
+    with open(path, "rb") as f:
+        bundle = pickle.load(f)
+    return bundle

@@ -2,14 +2,18 @@
 CLI entry point for the Hybrid Sentiment + Technical Trading System.
 
 Menu:
-  1. Sentiment analysis (live news demo)
-  2. Download stock data
-  3. Collect historical news (Finnhub)
-  4. Run full pipeline (collect -> score -> train -> evaluate -> backtest)
-  5. Run experiment only (train + evaluate, assumes data already collected)
-  6. Pretrain models (train and save to disk for live demo)
-  7. Live trading demo (predict today's signal)
-  8. Backtest simulation (day-by-day trading simulation with evaluation)
+  1.  Sentiment analysis (live news demo)
+  2.  Download stock data
+  3.  Collect historical news (Finnhub)
+  4.  Run full pipeline (collect -> score -> train -> evaluate -> backtest)
+  5.  Run experiment only (train + evaluate, assumes data already collected)
+  6.  Pretrain models (train and save to disk for live demo)
+  7.  Live trading demo (predict today's signal)
+  8.  Backtest simulation (day-by-day trading simulation with evaluation)
+  9.  Train universal (cross-stock) model
+  10. Fine-tune universal model per sector
+  11. Evaluate universal model (held-out stocks + per-sector)
+  12. Hyperparameter tuning (Optuna)
 """
 
 from dotenv import load_dotenv
@@ -425,27 +429,53 @@ def backtest_simulation():
     """
     Day-by-day trading simulation using a pretrained model.
 
-    Tests model generalization by training on one ticker and simulating
-    trading on multiple tickers. Produces evaluation charts and metrics.
+    Supports both per-ticker models (trained via option 6) and the
+    universal cross-stock model (trained via option 9).
     """
     from src.ml.simulation import run_generalization_test
 
     models_dir = "models"
     if not os.path.exists(models_dir):
-        print("No pretrained models found. Run option 6 first.")
+        print("No pretrained models found. Run option 6 or 9 first.")
         return
 
-    available = [f.replace("_model.pkl", "") for f in os.listdir(models_dir) if f.endswith("_model.pkl")]
-    if not available:
-        print("No pretrained models found. Run option 6 first.")
+    # Check what's available
+    per_ticker = [
+        f.replace("_model.pkl", "")
+        for f in os.listdir(models_dir)
+        if f.endswith("_model.pkl") and not f.startswith(("universal", "sector_"))
+    ]
+    has_universal = os.path.exists(os.path.join(models_dir, "universal_model.pkl"))
+
+    if not per_ticker and not has_universal:
+        print("No pretrained models found. Run option 6 or 9 first.")
         return
 
-    print(f"Available pretrained models: {', '.join(available)}")
-    model_ticker = input("Model ticker to use (default VOO): ").strip().upper() or "VOO"
+    print("Available models:")
+    if has_universal:
+        print("  [universal] - Cross-stock universal model")
+    for t in per_ticker:
+        print(f"  [{t}] - Per-ticker model")
 
-    if model_ticker not in available:
-        print(f"No pretrained model for {model_ticker}. Available: {', '.join(available)}")
-        return
+    model_choice = input(
+        "\nModel to use (ticker name or 'universal', default universal): "
+    ).strip()
+
+    if not model_choice:
+        use_universal = has_universal
+        model_ticker = "VOO"
+    elif model_choice.lower() == "universal":
+        if not has_universal:
+            print("No universal model found. Run option 9 first.")
+            return
+        use_universal = True
+        model_ticker = "universal"
+    else:
+        model_ticker = model_choice.upper()
+        if model_ticker not in per_ticker:
+            print(f"No pretrained model for {model_ticker}. Available: {', '.join(per_ticker)}")
+            return
+        use_universal = False
 
     test_input = input("Test tickers (comma-separated, default VOO,GOOG,JPM): ").strip()
     test_tickers = (
@@ -466,19 +496,217 @@ def backtest_simulation():
         sim_start=sim_start,
         sim_end=sim_end,
         initial_capital=initial_capital,
+        use_universal=use_universal,
     )
+
+
+def train_universal():
+    """
+    Two-phase universal model training:
+
+    Phase 1 – Train a base model on multi-year technical data from many
+    tickers.  Sentiment columns are present but zeroed out.
+
+    Phase 2 – Fine-tune with sentiment: warm-start the base model on
+    recent data (~1 year) where Finnhub news / FinBERT sentiment is
+    available.  The model learns to incorporate news signals on top of
+    the technical patterns learned in Phase 1.
+    """
+    from src.ml.universe import build_universal_dataset, get_all_tickers
+    from src.ml.features import get_feature_columns
+    from src.ml.train import train_universal_model, finetune_with_sentiment
+
+    start = input("Training data start (default 2019-01-01): ").strip() or "2019-01-01"
+
+    tickers_input = input(
+        "Tickers (comma-separated, or 'all' for full universe, default all): "
+    ).strip()
+    if tickers_input and tickers_input.lower() != "all":
+        tickers = [t.strip().upper() for t in tickers_input.split(",")]
+    else:
+        tickers = get_all_tickers()
+
+    train_end = input("Train cutoff date (default 2023-12-31): ").strip() or "2023-12-31"
+    val_end = input("Validation cutoff date (default 2024-06-30): ").strip() or "2024-06-30"
+
+    sentiment_start = input(
+        "Sentiment data available from (default 2025-04-01): "
+    ).strip() or "2025-04-01"
+
+    tune_input = input("Run Optuna hyperparameter tuning? (y/N): ").strip().lower()
+    do_tune = tune_input in ("y", "yes")
+
+    adaptive_input = input("Use adaptive labels? (y/N): ").strip().lower()
+    adaptive = adaptive_input in ("y", "yes")
+
+    # Build dataset with sentiment columns included but zeroed before
+    # the sentiment_start date (two-phase approach).
+    print(f"\n  Building universal dataset from {len(tickers)} tickers ...")
+    print(f"  Sentiment columns included (zeroed before {sentiment_start})")
+    df = build_universal_dataset(
+        tickers=tickers,
+        start=start,
+        include_sentiment=True,
+        sentiment_start=sentiment_start,
+        adaptive_label=adaptive,
+    )
+
+    feature_cols = get_feature_columns(df, include_sentiment=True)
+
+    # Phase 1: train base model on full date range (sentiment = zeros
+    # for the vast majority of rows, so the model learns technicals).
+    print("\n" + "=" * 60)
+    print("  PHASE 1: Technical base model (multi-year data)")
+    print("=" * 60)
+    bundle = train_universal_model(
+        df,
+        feature_cols,
+        train_end=train_end,
+        val_end=val_end,
+        tune=do_tune,
+    )
+
+    # Phase 2: warm-start fine-tune on recent data where sentiment is
+    # available, adding trees that can leverage news signals.
+    print("\n" + "=" * 60)
+    print("  PHASE 2: Sentiment fine-tuning (recent data)")
+    print("=" * 60)
+    bundle = finetune_with_sentiment(
+        bundle, df, feature_cols,
+        sentiment_start=sentiment_start,
+    )
+
+    print("\n" + "=" * 60)
+    print("  TWO-PHASE UNIVERSAL MODEL TRAINING COMPLETE")
+    print("  Model saved in models/ directory")
+    print("=" * 60)
+
+
+def finetune_sectors():
+    """Fine-tune the universal model for each sector."""
+    from src.ml.universe import build_universal_dataset, SECTORS, SECTOR_ID, get_all_tickers
+    from src.ml.features import get_feature_columns
+    from src.ml.train import load_universal_model, finetune_all_sectors
+
+    bundle = load_universal_model()
+    feature_cols = bundle["feature_columns"]
+    include_sentiment = bundle.get("include_sentiment", False)
+
+    start = input("Training data start (default 2019-01-01): ").strip() or "2019-01-01"
+    n_rounds = input("Extra boosting rounds per sector (default 50): ").strip() or "50"
+
+    tickers_input = input(
+        "Tickers (comma-separated, or 'all', default all): "
+    ).strip()
+    if tickers_input and tickers_input.lower() != "all":
+        tickers = [t.strip().upper() for t in tickers_input.split(",")]
+    else:
+        tickers = get_all_tickers()
+
+    print(f"\n  Building dataset for fine-tuning ...")
+    df = build_universal_dataset(
+        tickers=tickers, start=start, include_sentiment=include_sentiment,
+    )
+
+    finetune_all_sectors(
+        bundle, df, feature_cols,
+        n_extra_rounds=int(n_rounds),
+    )
+
+    print("\n" + "=" * 60)
+    print("  SECTOR FINE-TUNING COMPLETE")
+    print("  Models saved in models/ directory")
+    print("=" * 60)
+
+
+def evaluate_universal():
+    """Evaluate the universal model with held-out stocks and per-sector breakdown."""
+    from src.ml.universe import build_universal_dataset, SECTORS, get_all_tickers
+    from src.ml.features import get_feature_columns
+    from src.ml.train import load_universal_model
+    from src.ml.evaluation import evaluate_universal_model, evaluate_held_out_stocks
+
+    bundle = load_universal_model()
+    feature_cols = bundle["feature_columns"]
+    include_sentiment = bundle.get("include_sentiment", False)
+
+    start = input("Data start (default 2019-01-01): ").strip() or "2019-01-01"
+
+    held_out_input = input(
+        "Held-out tickers for unseen-stock test (comma-separated, default TSLA,NFLX,DIS): "
+    ).strip()
+    held_out = (
+        [t.strip().upper() for t in held_out_input.split(",")]
+        if held_out_input
+        else ["TSLA", "NFLX", "DIS"]
+    )
+
+    all_tickers = get_all_tickers() + held_out
+    # Deduplicate while preserving order
+    seen = set()
+    unique_tickers = []
+    for t in all_tickers:
+        if t not in seen:
+            unique_tickers.append(t)
+            seen.add(t)
+
+    print(f"\n  Building dataset for evaluation ...")
+    df = build_universal_dataset(
+        tickers=unique_tickers, start=start, include_sentiment=include_sentiment,
+    )
+
+    # Full test set evaluation (temporal, after training period)
+    train_end = bundle["metadata"].get("train_end", "2023-12-31")
+    from src.ml.universe import temporal_train_test_split
+    _, test_df = temporal_train_test_split(df, train_end)
+
+    if not test_df.empty:
+        print(f"\n  Temporal test set: {len(test_df)} rows after {train_end}")
+        evaluate_universal_model(bundle, test_df, feature_cols)
+
+    # Held-out stock evaluation
+    if held_out:
+        evaluate_held_out_stocks(bundle, df, held_out, feature_cols)
+
+
+def run_hyperparam_tuning():
+    """Run Optuna hyperparameter tuning on a single ticker or pooled data."""
+    from src.ml.features import build_feature_matrix, get_feature_columns
+    from src.ml.train import tune_hyperparameters
+
+    ticker = input("Ticker to tune on (default AAPL): ").strip().upper() or "AAPL"
+    start = input(f"Start date (default {DEFAULT_START}): ").strip() or DEFAULT_START
+    n_trials = input("Number of Optuna trials (default 50): ").strip() or "50"
+
+    print(f"\n  Building feature matrix for {ticker} ...")
+    df = build_feature_matrix(
+        ticker, start=start, include_sentiment=True,
+        use_relative_features=True,
+    )
+    feature_cols = get_feature_columns(df, include_sentiment=True)
+
+    print(f"  {len(df)} rows, {len(feature_cols)} features")
+    best_params = tune_hyperparameters(df, feature_cols, n_trials=int(n_trials))
+
+    print(f"\n  Best parameters for {ticker}:")
+    for k, v in best_params.items():
+        print(f"    {k}: {v}")
 
 
 def main():
     print("\n=== Hybrid Sentiment + Technical Trading System ===\n")
-    print("1 = Sentiment analysis (live news demo)")
-    print("2 = Download stock data")
-    print("3 = Collect historical news (Finnhub)")
-    print("4 = Run full pipeline (collect -> score -> train -> backtest)")
-    print("5 = Run experiment only (assumes data collected)")
-    print("6 = Pretrain models (VOO, GOOGL, JPM)")
-    print("7 = Live trading demo (predict today's signal)")
-    print("8 = Backtest simulation (generalization test)")
+    print(" 1 = Sentiment analysis (live news demo)")
+    print(" 2 = Download stock data")
+    print(" 3 = Collect historical news (Finnhub)")
+    print(" 4 = Run full pipeline (collect -> score -> train -> backtest)")
+    print(" 5 = Run experiment only (assumes data collected)")
+    print(" 6 = Pretrain models (VOO, GOOGL, JPM)")
+    print(" 7 = Live trading demo (predict today's signal)")
+    print(" 8 = Backtest simulation (generalization test)")
+    print(" 9 = Train universal (cross-stock) model")
+    print("10 = Fine-tune universal model per sector")
+    print("11 = Evaluate universal model (held-out + per-sector)")
+    print("12 = Hyperparameter tuning (Optuna)")
     print()
 
     action = int(input("Enter action: "))
@@ -498,6 +726,14 @@ def main():
         live_demo()
     elif action == 8:
         backtest_simulation()
+    elif action == 9:
+        train_universal()
+    elif action == 10:
+        finetune_sectors()
+    elif action == 11:
+        evaluate_universal()
+    elif action == 12:
+        run_hyperparam_tuning()
     else:
         print("Invalid action.")
 
