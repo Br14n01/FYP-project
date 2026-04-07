@@ -291,49 +291,87 @@ def live_demo():
     """
     Live trading signal demo.
 
-    Loads a pretrained model, fetches today's news + price data,
-    computes features, and predicts a trading signal.
+    Supports both per-ticker pretrained models (option 6) and the
+    universal cross-stock model (option 9).  When using the universal
+    model you can predict a signal for *any* ticker.
     """
-    from src.ml.train import load_pretrained
+    from src.ml.train import load_pretrained, load_universal_model
     from src.ml.features import (
         download_price_data,
         add_indicators,
+        add_relative_indicators,
         SENTIMENT_FEATURE_COLS,
     )
     from src.sentiment.news_sentimental_analysis import SentimentScorer
 
-    # List available pretrained models
     models_dir = "models"
     if not os.path.exists(models_dir):
-        print("No pretrained models found. Run option 6 first.")
+        print("No pretrained models found. Run option 6 or 9 first.")
         return
 
-    available = [f.replace("_model.pkl", "") for f in os.listdir(models_dir) if f.endswith("_model.pkl")]
-    if not available:
-        print("No pretrained models found. Run option 6 first.")
+    # Discover available models
+    per_ticker = [
+        f.replace("_model.pkl", "")
+        for f in os.listdir(models_dir)
+        if f.endswith("_model.pkl") and not f.startswith(("universal", "sector_"))
+    ]
+    has_universal = os.path.exists(os.path.join(models_dir, "universal_model.pkl"))
+
+    if not per_ticker and not has_universal:
+        print("No pretrained models found. Run option 6 or 9 first.")
         return
 
-    print(f"Available pretrained models: {', '.join(available)}")
-    ticker = input("Enter ticker: ").strip().upper()
+    print("Available models:")
+    if has_universal:
+        print("  [universal] - Cross-stock universal model (works for any ticker)")
+    for t in per_ticker:
+        print(f"  [{t}] - Per-ticker model")
 
-    if ticker not in available:
-        print(f"No pretrained model for {ticker}. Available: {', '.join(available)}")
-        return
+    model_choice = input(
+        "\nModel to use (ticker name or 'universal', default universal): "
+    ).strip()
 
-    # Load the pretrained model
-    bundle = load_pretrained(ticker, models_dir=models_dir)
+    if not model_choice:
+        use_universal = has_universal
+    elif model_choice.lower() == "universal":
+        if not has_universal:
+            print("No universal model found. Run option 9 first.")
+            return
+        use_universal = True
+    else:
+        model_choice = model_choice.upper()
+        if model_choice not in per_ticker:
+            print(f"No pretrained model for {model_choice}. Available: {', '.join(per_ticker)}")
+            return
+        use_universal = False
+
+    # Load model
+    if use_universal:
+        bundle = load_universal_model(models_dir=models_dir)
+        ticker = input("Enter ticker to predict (e.g. AAPL): ").strip().upper()
+    else:
+        ticker = model_choice
+        bundle = load_pretrained(ticker, models_dir=models_dir)
+
     model = bundle["model"]
     feature_cols = bundle["feature_columns"]
-    include_sentiment = bundle["include_sentiment"]
+    include_sentiment = bundle.get("include_sentiment", False)
     meta = bundle["metadata"]
 
-    print(f"\n  Model info: trained on {meta['n_samples']} days")
-    print(f"  Holdout accuracy: {meta['holdout_accuracy']:.4f}, F1: {meta['holdout_f1_macro']:.4f}")
+    if use_universal:
+        print(f"\n  Universal model: {meta['n_features']} features, "
+              f"trained on {meta['n_train']} samples")
+    else:
+        print(f"\n  Model info: trained on {meta['n_samples']} days")
+        print(f"  Holdout accuracy: {meta['holdout_accuracy']:.4f}, "
+              f"F1: {meta['holdout_f1_macro']:.4f}")
 
     # Step 1: Get today's technical indicators
     print(f"\n--- Fetching recent price data for {ticker} ---")
     df = download_price_data(ticker, start="2024-01-01")
     df_ta = add_indicators(df)
+    if use_universal:
+        df_ta = add_relative_indicators(df_ta)
     df_ta.dropna(inplace=True)
 
     if df_ta.empty:
@@ -411,8 +449,9 @@ def live_demo():
     bearish_proba = proba_map.get(1, 0.0)
     bullish_proba = proba_map.get(2, 0.0)
 
+    model_label = "Universal" if use_universal else ticker
     print(f"\n{'='*60}")
-    print(f"  LIVE SIGNAL for {ticker}")
+    print(f"  LIVE SIGNAL for {ticker} (model: {model_label})")
     print(f"  Date: {latest_date.strftime('%Y-%m-%d')}")
     print(f"  Close: ${today_row['Close'].values[0]:.2f}")
     print(f"{'='*60}")
