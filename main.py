@@ -463,25 +463,34 @@ def finetune_and_evaluate():
         else ["TSLA", "NFLX", "DIS"]
     )
 
-    all_tickers = get_all_tickers() + held_out
-    seen = set()
-    unique_tickers = []
-    for t in all_tickers:
-        if t not in seen:
-            unique_tickers.append(t)
-            seen.add(t)
+    temporal_input = input(
+        "Run full temporal test on all training tickers? (y/N): "
+    ).strip().lower()
+    run_temporal = temporal_input in ("y", "yes")
 
-    print(f"\n  Building dataset for evaluation ...")
+    if run_temporal:
+        all_tickers = get_all_tickers() + held_out
+        seen = set()
+        unique_tickers = []
+        for t in all_tickers:
+            if t not in seen:
+                unique_tickers.append(t)
+                seen.add(t)
+    else:
+        unique_tickers = list(held_out)
+
+    print(f"\n  Building dataset for evaluation ({len(unique_tickers)} tickers) ...")
     df_eval = build_universal_dataset(
         tickers=unique_tickers, start=start, include_sentiment=include_sentiment,
     )
 
     train_end = bundle["metadata"].get("train_end", "2023-12-31")
-    _, test_df = temporal_train_test_split(df_eval, train_end)
 
-    if not test_df.empty:
-        print(f"\n  Temporal test set: {len(test_df)} rows after {train_end}")
-        evaluate_universal_model(bundle, test_df, feature_cols)
+    if run_temporal:
+        _, test_df = temporal_train_test_split(df_eval, train_end)
+        if not test_df.empty:
+            print(f"\n  Temporal test set: {len(test_df)} rows after {train_end}")
+            evaluate_universal_model(bundle, test_df, feature_cols)
 
     if held_out:
         evaluate_held_out_stocks(bundle, df_eval, held_out, feature_cols)
