@@ -9,6 +9,8 @@ Menu:
   5. Fine-tune & evaluate universal model
   6. Live signal (predict today's trading signal)
   7. Backtest simulation (day-by-day trading simulation)
+  8. SHAP analysis (pretrained or universal model)
+  0. Quit
 """
 
 from dotenv import load_dotenv
@@ -742,6 +744,9 @@ def backtest_simulation():
     capital_str = input("Initial capital in USD (default 10000): ").strip() or "10000"
     initial_capital = float(capital_str)
 
+    short_input = input("Allow short selling? (y/N): ").strip().lower()
+    allow_short = short_input in ("y", "yes")
+
     run_generalization_test(
         model_ticker=model_ticker,
         test_tickers=test_tickers,
@@ -749,6 +754,161 @@ def backtest_simulation():
         sim_end=sim_end,
         initial_capital=initial_capital,
         use_universal=use_universal,
+        allow_short=allow_short,
+    )
+
+
+# ===================================================================
+# 8. SHAP analysis
+# ===================================================================
+
+def shap_analysis():
+    """Run SHAP feature-importance analysis for saved models."""
+    from src.ml.train import (
+        load_pretrained,
+        load_universal_model,
+        save_shap_from_model,
+    )
+    from src.ml.features import build_feature_matrix
+    from src.ml.universe import (
+        build_universal_dataset,
+        get_all_tickers,
+        temporal_train_test_split,
+    )
+
+    models_dir = "models"
+    if not os.path.exists(models_dir):
+        print("No models found. Run option 3c or 4 first.")
+        return
+
+    print("\n  SHAP analysis options:")
+    print("    a = Pretrained per-ticker model")
+    print("    b = Universal model")
+    sub = input("  Choose (a/b, default b): ").strip().lower() or "b"
+
+    sample_str = input("Rows to explain (default 500): ").strip() or "500"
+    sample_size = int(sample_str)
+
+    if sub == "a":
+        per_ticker = [
+            f.replace("_model.pkl", "")
+            for f in os.listdir(models_dir)
+            if f.endswith("_model.pkl") and not f.startswith(("universal", "sector_"))
+        ]
+        if not per_ticker:
+            print("No pretrained per-ticker models found. Run option 3c first.")
+            return
+
+        print("Available pretrained models:")
+        for t in per_ticker:
+            print(f"  [{t}]")
+
+        ticker = input("Ticker model to explain: ").strip().upper()
+        if ticker not in per_ticker:
+            print(f"No pretrained model for {ticker}.")
+            return
+
+        bundle = load_pretrained(ticker, models_dir=models_dir)
+        include_sentiment = bundle.get("include_sentiment", False)
+
+        start = input("Feature data start (default 2022-01-01): ").strip() or "2022-01-01"
+        end = input("Feature data end (default latest): ").strip() or None
+
+        print(f"\n  Building feature matrix for {ticker} ...")
+        df = build_feature_matrix(
+            ticker,
+            start=start,
+            end=end,
+            include_sentiment=include_sentiment,
+        )
+        split = int(len(df) * 0.8)
+        X_target = df.iloc[split:][bundle["feature_columns"]]
+
+        if X_target.empty:
+            print("Not enough rows in the test window for SHAP analysis.")
+            return
+
+        save_shap_from_model(
+            bundle["model"],
+            X_target,
+            bundle["feature_columns"],
+            label=f"{ticker}_pretrained",
+            output_dir="results",
+            sample_size=sample_size,
+        )
+        return
+
+    if sub != "b":
+        print("  Invalid sub-option.")
+        return
+
+    if not os.path.exists(os.path.join(models_dir, "universal_model.pkl")):
+        print("No universal model found. Run option 4 first.")
+        return
+
+    bundle = load_universal_model(models_dir=models_dir)
+    include_sentiment = bundle.get("include_sentiment", False)
+    meta = bundle["metadata"]
+
+    start = input("Dataset start (default 2019-01-01): ").strip() or "2019-01-01"
+    tickers_input = input(
+        "Tickers (comma-separated, or 'all' for full universe, default all): "
+    ).strip()
+    if tickers_input and tickers_input.lower() != "all":
+        tickers = [t.strip().upper() for t in tickers_input.split(",")]
+    else:
+        tickers = get_all_tickers()
+
+    sentiment_start = meta.get("sentiment_start")
+    if include_sentiment:
+        prompt = (
+            f"Sentiment start (default {sentiment_start}): "
+            if sentiment_start
+            else "Sentiment start (optional, press Enter to skip): "
+        )
+        sentiment_input = input(prompt).strip()
+        sentiment_start = sentiment_input or sentiment_start
+
+    subset_input = input(
+        "Subset to explain: train / val / test (default test): "
+    ).strip().lower() or "test"
+
+    print(f"\n  Building universal dataset from {len(tickers)} tickers ...")
+    df = build_universal_dataset(
+        tickers=tickers,
+        start=start,
+        include_sentiment=include_sentiment,
+        sentiment_start=sentiment_start,
+    )
+
+    train_end = meta.get("train_end", "2023-12-31")
+    val_end = meta.get("val_end")
+    if val_end:
+        train_df, val_df, test_df = temporal_train_test_split(df, train_end, val_end)
+    else:
+        train_df, test_df = temporal_train_test_split(df, train_end)
+        val_df = pd.DataFrame(columns=df.columns)
+
+    subset_map = {
+        "train": train_df,
+        "val": val_df,
+        "test": test_df,
+    }
+    target_df = subset_map.get(subset_input)
+    if target_df is None:
+        print("Invalid subset. Choose train, val, or test.")
+        return
+    if target_df.empty:
+        print(f"No rows found in the '{subset_input}' subset.")
+        return
+
+    save_shap_from_model(
+        bundle["model"],
+        target_df[bundle["feature_columns"]],
+        bundle["feature_columns"],
+        label=f"universal_{subset_input}",
+        output_dir="results",
+        sample_size=sample_size,
     )
 
 
@@ -757,33 +917,41 @@ def backtest_simulation():
 # ===================================================================
 
 def main():
-    print("\n=== Hybrid Sentiment + Technical Trading System ===\n")
-    print("  1 = Sentiment demo (live Google News scoring)")
-    print("  2 = Collect & score news (Finnhub + FinBERT pipeline)")
-    print("  3 = Per-ticker pipeline (train / evaluate / pretrain)")
-    print("  4 = Train universal model (two-phase: technical + sentiment)")
-    print("  5 = Fine-tune & evaluate universal model")
-    print("  6 = Live signal (predict today's trading signal)")
-    print("  7 = Backtest simulation (day-by-day trading simulation)")
-    print()
+    while True:
+        print("\n=== Hybrid Sentiment + Technical Trading System ===\n")
+        print("  1 = Sentiment demo (live Google News scoring)")
+        print("  2 = Collect & score news (Finnhub + FinBERT pipeline)")
+        print("  3 = Per-ticker pipeline (train / evaluate / pretrain)")
+        print("  4 = Train universal model (two-phase: technical + sentiment)")
+        print("  5 = Fine-tune & evaluate universal model")
+        print("  6 = Live signal (predict today's trading signal)")
+        print("  7 = Backtest simulation (day-by-day trading simulation)")
+        print("  8 = SHAP analysis (pretrained or universal model)")
+        print("  0 = Quit")
+        print()
 
-    action = int(input("Enter action: "))
-    if action == 1:
-        sentiment_demo()
-    elif action == 2:
-        collect_and_score_news()
-    elif action == 3:
-        per_ticker_pipeline()
-    elif action == 4:
-        train_universal()
-    elif action == 5:
-        finetune_and_evaluate()
-    elif action == 6:
-        live_signal()
-    elif action == 7:
-        backtest_simulation()
-    else:
-        print("Invalid action.")
+        action = input("Enter action: ").strip().lower()
+        if action in ("0", "q", "quit", "exit"):
+            print("Goodbye.")
+            break
+        if action == "1":
+            sentiment_demo()
+        elif action == "2":
+            collect_and_score_news()
+        elif action == "3":
+            per_ticker_pipeline()
+        elif action == "4":
+            train_universal()
+        elif action == "5":
+            finetune_and_evaluate()
+        elif action == "6":
+            live_signal()
+        elif action == "7":
+            backtest_simulation()
+        elif action == "8":
+            shap_analysis()
+        else:
+            print("Invalid action.")
 
 
 if __name__ == "__main__":

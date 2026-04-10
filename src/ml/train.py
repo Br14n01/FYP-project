@@ -554,6 +554,90 @@ def _save_shap(
     print(f"  SHAP analysis saved -> {chart_dir}/{symbol}_shap_importance.png")
 
 
+def save_shap_from_model(
+    model,
+    X: pd.DataFrame,
+    feature_cols: list[str],
+    label: str,
+    output_dir: str = "results",
+    sample_size: int = 500,
+):
+    """
+    Compute SHAP values for an already-trained model and save a CSV plus
+    bar chart of mean absolute feature importance.
+
+    Parameters
+    ----------
+    model : fitted tree model
+        Typically an XGBoost model bundle["model"].
+    X : DataFrame
+        Feature matrix to explain.
+    feature_cols : list[str]
+        Feature column names in model order.
+    label : str
+        Output file prefix, e.g. "universal_test" or "AAPL_pretrained".
+    sample_size : int
+        Maximum number of rows to explain.  Rows are sampled randomly for
+        speed and memory safety on larger datasets.
+    """
+    try:
+        import shap
+    except ImportError:
+        print("  shap not installed, skipping SHAP analysis.")
+        return
+
+    if X.empty:
+        raise ValueError("No rows available for SHAP analysis.")
+
+    os.makedirs(output_dir, exist_ok=True)
+    chart_dir = os.path.join(output_dir, "chart")
+    os.makedirs(chart_dir, exist_ok=True)
+
+    X_use = X[feature_cols]
+    if len(X_use) > sample_size:
+        X_use = X_use.sample(n=sample_size, random_state=42)
+
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_use)
+
+    # Mean absolute SHAP per feature (average across classes)
+    if isinstance(shap_values, list):
+        mean_shap = np.mean(
+            [np.abs(sv).mean(axis=0) for sv in shap_values], axis=0
+        )
+    else:
+        shap_arr = np.asarray(shap_values)
+        if shap_arr.ndim == 3:
+            mean_shap = np.abs(shap_arr).mean(axis=(0, 2))
+        else:
+            mean_shap = np.abs(shap_arr).mean(axis=0)
+
+    importance_df = (
+        pd.DataFrame({"feature": feature_cols, "mean_abs_shap": mean_shap})
+        .sort_values("mean_abs_shap", ascending=False)
+    )
+    csv_path = os.path.join(output_dir, f"{label}_feature_importance.csv")
+    importance_df.to_csv(csv_path, index=False)
+
+    top = importance_df.head(20)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    bars = ax.barh(top["feature"][::-1], top["mean_abs_shap"][::-1])
+    ax.set_xlabel("Mean |SHAP|")
+    ax.set_title(f"{label} - Top 20 Features by SHAP Importance")
+
+    for bar, feat in zip(bars, top["feature"][::-1]):
+        if feat.startswith("sent_"):
+            bar.set_color("orange")
+
+    fig.tight_layout()
+    png_path = os.path.join(chart_dir, f"{label}_shap_importance.png")
+    fig.savefig(png_path, dpi=150)
+    plt.close(fig)
+
+    print(f"  SHAP CSV saved -> {csv_path}")
+    print(f"  SHAP chart saved -> {png_path}")
+
+
 def _save_comparison_table(results: dict, symbol: str, output_dir: str):
     """Save a CSV comparing all configs side-by-side."""
     rows = []
