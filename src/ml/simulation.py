@@ -81,6 +81,7 @@ def run_simulation(
     articles_per_day: int = 5,
     output_dir: str = "results",
     use_universal: bool = False,
+    allow_short: bool = False,
 ) -> dict:
     """
     Run a day-by-day trading simulation.
@@ -105,6 +106,9 @@ def run_simulation(
     use_universal : bool
         If True, load the universal cross-stock model instead of a
         per-ticker pretrained model.
+    allow_short : bool
+        If True, SELL signals when flat will open a short position,
+        and BUY signals when short will cover the position.
 
     Returns
     -------
@@ -114,10 +118,12 @@ def run_simulation(
 
     model_label = "universal" if use_universal else model_ticker
 
+    mode_str = "long + short" if allow_short else "long only"
+
     print(f"\n{'='*60}")
     print(f"  SIMULATION: model={model_label}, trading={test_ticker}")
     print(f"  Period: {sim_start} -> {sim_end}")
-    print(f"  Capital: ${initial_capital:,.2f}")
+    print(f"  Capital: ${initial_capital:,.2f}  |  Mode: {mode_str}")
     print(f"{'='*60}")
 
     # Load model
@@ -222,14 +228,25 @@ def run_simulation(
         trade_shares = 0
 
         # Force close on last day
-        if is_last_day and shares > 0:
-            cash += shares * close_price
-            trade_shares = -shares
-            action_taken = "CLOSE_ALL"
-            trades.append({
-                "date": day_str, "action": "SELL (close)", "shares": abs(trade_shares),
-                "price": close_price, "value": abs(trade_shares) * close_price,
-            })
+        if is_last_day and shares != 0:
+            if shares > 0:
+                cash += shares * close_price
+                trade_shares = -shares
+                action_taken = "CLOSE_ALL"
+                trades.append({
+                    "date": day_str, "action": "SELL (close)", "shares": abs(trade_shares),
+                    "price": close_price, "value": abs(trade_shares) * close_price,
+                })
+            else:
+                # Cover short position
+                cover_cost = abs(shares) * close_price
+                cash -= cover_cost
+                trade_shares = abs(shares)
+                action_taken = "CLOSE_ALL"
+                trades.append({
+                    "date": day_str, "action": "COVER (close)", "shares": abs(shares),
+                    "price": close_price, "value": cover_cost,
+                })
             shares = 0
         elif prediction == 2 and shares == 0:
             # BUY: invest all cash
@@ -243,8 +260,19 @@ def run_simulation(
                     "date": day_str, "action": "BUY", "shares": trade_shares,
                     "price": close_price, "value": cost,
                 })
+        elif prediction == 2 and shares < 0:
+            # Cover short position on bullish signal
+            cover_cost = abs(shares) * close_price
+            cash -= cover_cost
+            trade_shares = abs(shares)
+            action_taken = "COVER"
+            trades.append({
+                "date": day_str, "action": "COVER", "shares": abs(shares),
+                "price": close_price, "value": cover_cost,
+            })
+            shares = 0
         elif prediction == 1 and shares > 0:
-            # SELL: close position
+            # SELL: close long position
             revenue = shares * close_price
             cash += revenue
             trade_shares = -shares
@@ -254,6 +282,19 @@ def run_simulation(
                 "price": close_price, "value": revenue,
             })
             shares = 0
+        elif prediction == 1 and shares == 0 and allow_short:
+            # SHORT: open short position
+            short_shares = int(cash // close_price)
+            if short_shares > 0:
+                proceeds = short_shares * close_price
+                cash += proceeds
+                shares = -short_shares
+                trade_shares = -short_shares
+                action_taken = "SHORT"
+                trades.append({
+                    "date": day_str, "action": "SHORT", "shares": short_shares,
+                    "price": close_price, "value": proceeds,
+                })
 
         portfolio_value = cash + shares * close_price
 
@@ -270,7 +311,7 @@ def run_simulation(
             "sent_mean": sent_features["sent_mean"],
         })
 
-        arrow = {"BUY": ">>>", "SELL": "<<<", "CLOSE_ALL": "XXX", "HOLD": "   "}
+        arrow = {"BUY": ">>>", "SELL": "<<<", "SHORT": "vvv", "COVER": "^^^", "CLOSE_ALL": "XXX", "HOLD": "   "}
         print(
             f"  {day_str}  ${close_price:>8.2f}  "
             f"signal={signal_map.get(prediction, '?'):<4}  "
@@ -320,15 +361,25 @@ def _compute_metrics(log_df: pd.DataFrame, initial_capital: float, trades: list)
     else:
         sortino = 0.0
 
-    # Win rate from trades
+    # Win rate from trades (long and short round trips)
     trade_returns = []
-    buy_price = None
+    entry_price = None
+    entry_side = None
     for t in trades:
         if t["action"] == "BUY":
-            buy_price = t["price"]
-        elif t["action"] in ("SELL", "SELL (close)") and buy_price is not None:
-            trade_returns.append((t["price"] - buy_price) / buy_price)
-            buy_price = None
+            entry_price = t["price"]
+            entry_side = "long"
+        elif t["action"] == "SHORT":
+            entry_price = t["price"]
+            entry_side = "short"
+        elif t["action"] in ("SELL", "SELL (close)") and entry_side == "long" and entry_price is not None:
+            trade_returns.append((t["price"] - entry_price) / entry_price)
+            entry_price = None
+            entry_side = None
+        elif t["action"] in ("COVER", "COVER (close)") and entry_side == "short" and entry_price is not None:
+            trade_returns.append((entry_price - t["price"]) / entry_price)
+            entry_price = None
+            entry_side = None
 
     winning_trades = sum(1 for r in trade_returns if r > 0)
     total_round_trips = len(trade_returns)
@@ -484,6 +535,7 @@ def run_generalization_test(
     initial_capital: float = 10_000.0,
     output_dir: str = "results",
     use_universal: bool = False,
+    allow_short: bool = False,
 ) -> dict[str, dict]:
     """
     Test whether a model generalizes to multiple tickers.
@@ -493,6 +545,8 @@ def run_generalization_test(
     use_universal : bool
         If True, use the universal cross-stock model instead of a
         per-ticker pretrained model.
+    allow_short : bool
+        If True, enable short selling in the simulation.
     """
     if test_tickers is None:
         test_tickers = ["VOO", "GOOG", "JPM"]
@@ -513,6 +567,7 @@ def run_generalization_test(
                 initial_capital=initial_capital,
                 output_dir=output_dir,
                 use_universal=use_universal,
+                allow_short=allow_short,
             )
             all_results[ticker] = result.get("metrics", {})
         except Exception as e:
