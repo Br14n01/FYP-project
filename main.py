@@ -769,7 +769,7 @@ def shap_analysis():
         load_universal_model,
         save_shap_from_model,
     )
-    from src.ml.features import build_feature_matrix
+    from src.ml.features import build_feature_matrix, SENTIMENT_FEATURE_COLS
     from src.ml.universe import (
         build_universal_dataset,
         get_all_tickers,
@@ -901,6 +901,27 @@ def shap_analysis():
     if target_df.empty:
         print(f"No rows found in the '{subset_input}' subset.")
         return
+
+    if include_sentiment and sentiment_start:
+        pre_filter_rows = len(target_df)
+        target_df = target_df[target_df.index >= pd.Timestamp(sentiment_start)]
+        print(
+            f"  Restricting SHAP rows to dates on/after {sentiment_start}: "
+            f"{len(target_df)} of {pre_filter_rows} rows kept"
+        )
+        if target_df.empty:
+            print("No post-sentiment rows found in the selected subset.")
+            return
+
+    if include_sentiment:
+        sent_cols = [c for c in SENTIMENT_FEATURE_COLS if c in target_df.columns]
+        if sent_cols:
+            nonzero_sent = (target_df[sent_cols] != 0).any().any()
+            if not nonzero_sent:
+                print(
+                    "  Warning: all sentiment feature values are zero in the selected "
+                    "rows. SHAP for sent_* features will likely be 0.0."
+                )
 
     save_shap_from_model(
         bundle["model"],
