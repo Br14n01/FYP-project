@@ -310,6 +310,28 @@ CONFIG_NAMES = [
 ]
 
 
+def _filter_post_sentiment_window(
+    df: pd.DataFrame,
+    post_sentiment_start: str | None,
+    context: str,
+) -> pd.DataFrame:
+    """Optionally restrict a dataset to rows on/after a sentiment cutoff."""
+    if not post_sentiment_start:
+        return df
+
+    filtered = df[df.index >= pd.Timestamp(post_sentiment_start)].copy()
+    print(
+        f"  {context}: keeping {len(filtered)} of {len(df)} rows on/after "
+        f"{post_sentiment_start}"
+    )
+    if filtered.empty:
+        raise ValueError(
+            f"No rows remain after applying post-sentiment start "
+            f"{post_sentiment_start}."
+        )
+    return filtered
+
+
 def run_experiment(
     symbol: str,
     start: str = "2022-01-01",
@@ -318,6 +340,7 @@ def run_experiment(
     thresh: float = 0.01,
     n_splits: int = 5,
     output_dir: str = "results",
+    post_sentiment_start: str | None = None,
 ) -> dict:
     """
     Run the full comparison experiment for a single ticker.
@@ -343,6 +366,9 @@ def run_experiment(
         lookahead=lookahead,
         thresh=thresh,
         include_sentiment=True,
+    )
+    df = _filter_post_sentiment_window(
+        df, post_sentiment_start, f"{symbol} post-sentiment filter"
     )
 
     all_features = get_feature_columns(df, include_sentiment=True)
@@ -666,6 +692,7 @@ def run_all_experiments(
     thresh: float = 0.01,
     n_splits: int = 5,
     output_dir: str = "results",
+    post_sentiment_start: str | None = None,
 ) -> dict[str, dict]:
     """Run experiments for a list of tickers and return all results."""
     all_results = {}
@@ -679,6 +706,7 @@ def run_all_experiments(
                 thresh=thresh,
                 n_splits=n_splits,
                 output_dir=output_dir,
+                post_sentiment_start=post_sentiment_start,
             )
         except Exception as e:
             print(f"  ERROR with {ticker}: {e}")
@@ -727,6 +755,7 @@ def pretrain_and_save(
     thresh: float = 0.01,
     include_sentiment: bool = True,
     models_dir: str = MODELS_DIR,
+    post_sentiment_start: str | None = None,
 ) -> dict:
     """
     Train a hybrid XGBoost model on all available data for a ticker
@@ -751,6 +780,9 @@ def pretrain_and_save(
         lookahead=lookahead,
         thresh=thresh,
         include_sentiment=include_sentiment,
+    )
+    df = _filter_post_sentiment_window(
+        df, post_sentiment_start, f"{symbol} pretrain post-sentiment filter"
     )
 
     feature_cols = get_feature_columns(df, include_sentiment=include_sentiment)
@@ -788,6 +820,7 @@ def pretrain_and_save(
             "end": end or "latest",
             "lookahead": lookahead,
             "threshold": thresh,
+            "post_sentiment_start": post_sentiment_start,
             "n_samples": len(X),
             "n_features": len(feature_cols),
             "holdout_accuracy": acc,
@@ -827,12 +860,17 @@ def pretrain_multiple(
     start: str = "2022-01-01",
     end: str | None = None,
     include_sentiment: bool = True,
+    post_sentiment_start: str | None = None,
 ):
     """Pretrain and save models for multiple tickers."""
     for ticker in tickers:
         try:
             pretrain_and_save(
-                ticker, start=start, end=end, include_sentiment=include_sentiment
+                ticker,
+                start=start,
+                end=end,
+                include_sentiment=include_sentiment,
+                post_sentiment_start=post_sentiment_start,
             )
         except Exception as e:
             print(f"  ERROR pre-training {ticker}: {e}")
@@ -852,6 +890,7 @@ def train_universal_model(
     tune: bool = False,
     tune_trials: int = 50,
     models_dir: str = MODELS_DIR,
+    post_sentiment_start: str | None = None,
 ) -> dict:
     """
     Train a single XGBoost model on pooled multi-stock data.
@@ -883,6 +922,10 @@ def train_universal_model(
     print(f"\n{'='*60}")
     print(f"  TRAINING UNIVERSAL MODEL")
     print(f"{'='*60}")
+
+    df = _filter_post_sentiment_window(
+        df, post_sentiment_start, "Universal post-sentiment filter"
+    )
 
     if val_end:
         train_df, val_df, test_df = temporal_train_test_split(df, train_end, val_end)
@@ -956,6 +999,7 @@ def train_universal_model(
         "metadata": {
             "train_end": train_end,
             "val_end": val_end,
+            "post_sentiment_start": post_sentiment_start,
             "n_train": len(train_df),
             "n_test": len(test_df),
             "n_features": len(feature_cols),

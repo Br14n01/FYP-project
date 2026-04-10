@@ -178,6 +178,9 @@ def _run_full_pipeline():
         if tickers_input
         else TARGET_TICKERS
     )
+    post_sentiment_start = input(
+        "Post-sentiment only from date (optional, press Enter for full history): "
+    ).strip() or None
 
     # Step 1-3: News pipeline
     print("\n" + "=" * 60)
@@ -211,14 +214,24 @@ def _run_full_pipeline():
     print("  STEP 4: Training models and running experiments")
     print("=" * 60)
     all_results = run_all_experiments(
-        tickers, start=start, end=end, output_dir="results"
+        tickers,
+        start=start,
+        end=end,
+        output_dir="results",
+        post_sentiment_start=post_sentiment_start,
     )
 
     # Step 5: Backtest
     print("\n" + "=" * 60)
     print("  STEP 5: Backtesting strategies")
     print("=" * 60)
-    _run_backtests(tickers, start, end, all_results)
+    _run_backtests(
+        tickers,
+        start,
+        end,
+        all_results,
+        post_sentiment_start=post_sentiment_start,
+    )
 
     print("\n" + "=" * 60)
     print("  PIPELINE COMPLETE – Results saved in results/")
@@ -240,11 +253,24 @@ def _run_experiment_only():
         if tickers_input
         else TARGET_TICKERS
     )
+    post_sentiment_start = input(
+        "Post-sentiment only from date (optional, press Enter for full history): "
+    ).strip() or None
 
     all_results = run_all_experiments(
-        tickers, start=start, end=end, output_dir="results"
+        tickers,
+        start=start,
+        end=end,
+        output_dir="results",
+        post_sentiment_start=post_sentiment_start,
     )
-    _run_backtests(tickers, start, end, all_results)
+    _run_backtests(
+        tickers,
+        start,
+        end,
+        all_results,
+        post_sentiment_start=post_sentiment_start,
+    )
 
 
 def _pretrain_models():
@@ -265,6 +291,9 @@ def _pretrain_models():
         if tickers_input
         else PRETRAIN_TICKERS
     )
+    post_sentiment_start = input(
+        "Post-sentiment only from date (optional, press Enter for full history): "
+    ).strip() or None
 
     for ticker in tickers:
         news_csv = f"dataset/{ticker}_news.csv"
@@ -284,14 +313,20 @@ def _pretrain_models():
     print("\n" + "=" * 60)
     print("  TRAINING AND SAVING MODELS")
     print("=" * 60)
-    pretrain_multiple(tickers, start=start, end=end, include_sentiment=True)
+    pretrain_multiple(
+        tickers,
+        start=start,
+        end=end,
+        include_sentiment=True,
+        post_sentiment_start=post_sentiment_start,
+    )
 
     print("\n" + "=" * 60)
     print("  PRE-TRAINING COMPLETE – Models saved in models/")
     print("=" * 60)
 
 
-def _run_backtests(tickers, start, end, all_results):
+def _run_backtests(tickers, start, end, all_results, post_sentiment_start: str | None = None):
     """Backtest each ticker using the hybrid XGBoost model predictions."""
     from src.ml.features import build_feature_matrix, get_feature_columns
     from src.ml.train import _xgb_model
@@ -306,6 +341,11 @@ def _run_backtests(tickers, start, end, all_results):
             df = build_feature_matrix(
                 ticker, start=start, end=end, include_sentiment=True
             )
+            if post_sentiment_start:
+                df = df[df.index >= pd.Timestamp(post_sentiment_start)].copy()
+                if df.empty:
+                    print(f"  No rows after {post_sentiment_start}, skipping.")
+                    continue
             features = get_feature_columns(df, include_sentiment=True)
             split = int(len(df) * 0.8)
             train, test = df.iloc[:split], df.iloc[split:]
@@ -365,6 +405,10 @@ def train_universal():
 
     adaptive_input = input("Use adaptive labels? (y/N): ").strip().lower()
     adaptive = adaptive_input in ("y", "yes")
+    post_sentiment_only_input = input(
+        "Train/evaluate only on or after sentiment start? (y/N): "
+    ).strip().lower()
+    post_sentiment_only = post_sentiment_only_input in ("y", "yes")
 
     print(f"\n  Building universal dataset from {len(tickers)} tickers ...")
     print(f"  Sentiment columns included (zeroed before {sentiment_start})")
@@ -387,6 +431,7 @@ def train_universal():
         train_end=train_end,
         val_end=val_end,
         tune=do_tune,
+        post_sentiment_start=sentiment_start if post_sentiment_only else None,
     )
 
     print("\n" + "=" * 60)
@@ -455,6 +500,7 @@ def finetune_and_evaluate():
         return
 
     start = input("Eval data start (default 2019-01-01): ").strip() or "2019-01-01"
+    post_sentiment_start = bundle["metadata"].get("post_sentiment_start")
 
     held_out_input = input(
         "Held-out tickers for unseen-stock test (comma-separated, default TSLA,NFLX,DIS): "
@@ -485,6 +531,16 @@ def finetune_and_evaluate():
     df_eval = build_universal_dataset(
         tickers=unique_tickers, start=start, include_sentiment=include_sentiment,
     )
+    if post_sentiment_start:
+        pre_filter_rows = len(df_eval)
+        df_eval = df_eval[df_eval.index >= pd.Timestamp(post_sentiment_start)].copy()
+        print(
+            f"  Post-sentiment evaluation filter: keeping {len(df_eval)} of "
+            f"{pre_filter_rows} rows on/after {post_sentiment_start}"
+        )
+        if df_eval.empty:
+            print("  No rows remain after post-sentiment filtering.")
+            return
 
     train_end = bundle["metadata"].get("train_end", "2023-12-31")
 
