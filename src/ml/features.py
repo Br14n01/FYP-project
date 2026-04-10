@@ -179,7 +179,7 @@ def add_relative_indicators(data: pd.DataFrame) -> pd.DataFrame:
 def generate_label(
     data: pd.DataFrame,
     lookahead: int = 5,
-    thresh: float = 0.01,
+    thresh: float = 0.02,
     col: str = "Close",
 ) -> pd.Series:
     """
@@ -280,7 +280,7 @@ def build_feature_matrix(
     start: str = "2022-01-01",
     end: str | None = None,
     lookahead: int = 5,
-    thresh: float = 0.01,
+    thresh: float = 0.02,
     include_sentiment: bool = True,
     use_relative_features: bool = False,
     adaptive_label: bool = False,

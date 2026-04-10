@@ -130,7 +130,7 @@ def run_simulation(
     include_sentiment = bundle.get("include_sentiment", False)
 
     # Download price data with enough lookback for indicators
-    lookback_start = (datetime.strptime(sim_start, "%Y-%m-%d") - timedelta(days=120)).strftime("%Y-%m-%d")
+    lookback_start = (datetime.strptime(sim_start, "%Y-%m-%d") - timedelta(days=400)).strftime("%Y-%m-%d")
     sim_end_dt = datetime.strptime(sim_end, "%Y-%m-%d")
     fetch_end = (sim_end_dt + timedelta(days=3)).strftime("%Y-%m-%d")
 
