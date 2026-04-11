@@ -411,12 +411,16 @@ def train_universal():
         "Train/evaluate only on or after sentiment start? (y/N): "
     ).strip().lower()
     post_sentiment_only = post_sentiment_only_input in ("y", "yes")
+    label_thresh = 33.0 if adaptive else 0.01
 
     print(f"\n  Building universal dataset from {len(tickers)} tickers ...")
     print(f"  Sentiment columns included (zeroed before {sentiment_start})")
+    if adaptive:
+        print(f"  Adaptive label percentile: {label_thresh}")
     df = build_universal_dataset(
         tickers=tickers,
         start=start,
+        thresh=label_thresh,
         include_sentiment=True,
         sentiment_start=sentiment_start,
         adaptive_label=adaptive,
