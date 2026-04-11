@@ -37,6 +37,7 @@ def evaluate_universal_model(
     feature_cols: list[str],
     label_col: str = "label",
     output_dir: str = "results",
+    report_label: str = "universal",
 ) -> dict:
     """
     Comprehensive evaluation of a universal model on a test set.
@@ -70,6 +71,7 @@ def evaluate_universal_model(
 
     _print_report(report)
     _save_report(report, output_dir)
+    _save_confusion_matrix(y_test, y_pred, report_label, output_dir)
     _plot_sector_comparison(sector_metrics, output_dir)
 
     return report
@@ -82,6 +84,7 @@ def evaluate_held_out_stocks(
     feature_cols: list[str],
     label_col: str = "label",
     output_dir: str = "results",
+    report_label: str = "universal_held_out",
 ) -> dict:
     """
     Evaluate model on stocks it has never seen during training.
@@ -101,7 +104,7 @@ def evaluate_held_out_stocks(
     print(f"{'='*60}")
 
     return evaluate_universal_model(
-        bundle, held_out_df, feature_cols, label_col, output_dir
+        bundle, held_out_df, feature_cols, label_col, output_dir, report_label
     )
 
 
@@ -239,3 +242,43 @@ def _plot_sector_comparison(sector_metrics: dict, output_dir: str):
     fig.savefig(os.path.join(chart_dir, "universal_sector_comparison.png"), dpi=150)
     plt.close(fig)
     print(f"  Sector comparison chart saved -> {chart_dir}/universal_sector_comparison.png")
+
+
+def _save_confusion_matrix(
+    y_true: pd.Series | np.ndarray,
+    y_pred: np.ndarray,
+    label: str,
+    output_dir: str,
+):
+    """Save a normalized confusion matrix for a universal-model evaluation."""
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2])
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cmn = np.divide(cm, row_sums, out=np.zeros_like(cm, dtype=float), where=row_sums != 0)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cmn, cmap="Blues", vmin=0.0, vmax=1.0)
+
+    class_names = ["Neutral", "Bearish", "Bullish"]
+    ax.set_xticks(range(len(class_names)))
+    ax.set_yticks(range(len(class_names)))
+    ax.set_xticklabels(class_names)
+    ax.set_yticklabels(class_names)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(f"{label.replace('_', ' ').title()} Confusion Matrix")
+
+    for i in range(cmn.shape[0]):
+        for j in range(cmn.shape[1]):
+            val = cmn[i, j]
+            color = "white" if val >= 0.5 else "black"
+            ax.text(j, i, f"{val:.2f}", ha="center", va="center", color=color)
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+
+    chart_dir = os.path.join(output_dir, "chart")
+    os.makedirs(chart_dir, exist_ok=True)
+    path = os.path.join(chart_dir, f"{label}_confusion_matrix.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Confusion matrix saved -> {path}")

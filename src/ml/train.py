@@ -332,6 +332,56 @@ def _filter_post_sentiment_window(
     return filtered
 
 
+def _late_fusion_adjust_predictions(
+    base_predictions: np.ndarray,
+    df_context: pd.DataFrame,
+    positive_threshold: float = 0.05,
+    negative_threshold: float = -0.05,
+) -> tuple[np.ndarray, dict]:
+    """
+    Apply a sentiment confirmation layer to base model predictions.
+
+    Rules
+    -----
+    - BUY (2) is downgraded to HOLD (0) if sentiment is strongly negative.
+    - SELL (1) is downgraded to HOLD (0) if sentiment is strongly positive.
+    - HOLD (0) is unchanged.
+    """
+    adjusted = np.array(base_predictions, dtype=int).copy()
+    sent_mean = (
+        df_context["sent_mean"].fillna(0.0).to_numpy()
+        if "sent_mean" in df_context.columns
+        else np.zeros(len(adjusted))
+    )
+
+    buy_veto = (adjusted == 2) & (sent_mean <= negative_threshold)
+    sell_veto = (adjusted == 1) & (sent_mean >= positive_threshold)
+
+    adjusted[buy_veto] = 0
+    adjusted[sell_veto] = 0
+
+    stats = {
+        "buy_veto_count": int(buy_veto.sum()),
+        "sell_veto_count": int(sell_veto.sum()),
+        "total_adjustments": int((buy_veto | sell_veto).sum()),
+    }
+    return adjusted, stats
+
+
+def _classification_metrics_dict(y_true, y_pred) -> dict:
+    """Compute standard multi-class classification metrics."""
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "f1_macro": float(f1_score(y_true, y_pred, average="macro")),
+        "precision_macro": float(
+            precision_score(y_true, y_pred, average="macro", zero_division=0)
+        ),
+        "recall_macro": float(
+            recall_score(y_true, y_pred, average="macro", zero_division=0)
+        ),
+    }
+
+
 def run_experiment(
     symbol: str,
     start: str = "2022-01-01",
@@ -855,6 +905,23 @@ def load_pretrained(symbol: str, models_dir: str = MODELS_DIR) -> dict:
     return bundle
 
 
+def load_late_fusion_pretrained(symbol: str, models_dir: str = MODELS_DIR) -> dict:
+    """Load a late-fusion per-ticker model bundle from disk."""
+    path = os.path.join(models_dir, f"{symbol}_late_fusion_model.pkl")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No late-fusion model for {symbol}. Run option 9 first."
+        )
+    with open(path, "rb") as f:
+        bundle = pickle.load(f)
+    print(f"  Loaded late-fusion model for {bundle['metadata']['symbol']}")
+    print(
+        f"  Trained on {bundle['metadata']['n_samples']} samples, "
+        f"{bundle['metadata']['n_features']} technical features"
+    )
+    return bundle
+
+
 def pretrain_multiple(
     tickers: list[str],
     start: str = "2022-01-01",
@@ -874,6 +941,250 @@ def pretrain_multiple(
             )
         except Exception as e:
             print(f"  ERROR pre-training {ticker}: {e}")
+
+
+def train_and_save_late_fusion_ticker(
+    symbol: str,
+    start: str = "2022-01-01",
+    end: str | None = None,
+    lookahead: int = 5,
+    thresh: float = 0.01,
+    post_sentiment_start: str | None = None,
+    positive_threshold: float = 0.05,
+    negative_threshold: float = -0.05,
+    output_dir: str = "results",
+    models_dir: str = MODELS_DIR,
+) -> dict:
+    """
+    Train a technical XGBoost base model and save a separate late-fusion
+    model bundle that applies sentiment as a final confirmation layer.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(models_dir, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"  TRAINING LATE-FUSION MODEL: {symbol}")
+    print(f"{'='*60}")
+
+    df = build_feature_matrix(
+        symbol,
+        start=start,
+        end=end,
+        lookahead=lookahead,
+        thresh=thresh,
+        include_sentiment=True,
+    )
+    df = _filter_post_sentiment_window(
+        df, post_sentiment_start, f"{symbol} late-fusion post-sentiment filter"
+    )
+
+    tech_features = get_feature_columns(df, include_sentiment=False)
+    split = int(len(df) * 0.8)
+    train_df, test_df = df.iloc[:split], df.iloc[split:]
+    if train_df.empty or test_df.empty:
+        raise ValueError("Not enough rows for late-fusion train/test split.")
+
+    model_eval = _xgb_model(n_classes=int(train_df["label"].nunique()))
+    model_eval.fit(train_df[tech_features], train_df["label"])
+
+    base_pred = model_eval.predict(test_df[tech_features])
+    final_pred, fusion_stats = _late_fusion_adjust_predictions(
+        base_pred,
+        test_df,
+        positive_threshold=positive_threshold,
+        negative_threshold=negative_threshold,
+    )
+
+    base_metrics = _classification_metrics_dict(test_df["label"], base_pred)
+    late_fusion_metrics = _classification_metrics_dict(test_df["label"], final_pred)
+
+    print(
+        f"  Base technical model: acc={base_metrics['accuracy']:.4f} "
+        f"F1={base_metrics['f1_macro']:.4f}"
+    )
+    print(
+        f"  Late-fusion final:   acc={late_fusion_metrics['accuracy']:.4f} "
+        f"F1={late_fusion_metrics['f1_macro']:.4f}"
+    )
+    print(
+        f"  Sentiment vetoes: BUY={fusion_stats['buy_veto_count']} "
+        f"SELL={fusion_stats['sell_veto_count']}"
+    )
+
+    model_final = _xgb_model(n_classes=int(df["label"].nunique()))
+    model_final.fit(df[tech_features], df["label"])
+
+    bundle = {
+        "model": model_final,
+        "feature_columns": tech_features,
+        "model_type": "late_fusion",
+        "include_sentiment": True,
+        "fusion_config": {
+            "positive_threshold": positive_threshold,
+            "negative_threshold": negative_threshold,
+        },
+        "metadata": {
+            "symbol": symbol,
+            "start": start,
+            "end": end or "latest",
+            "lookahead": lookahead,
+            "threshold": thresh,
+            "post_sentiment_start": post_sentiment_start,
+            "n_samples": len(df),
+            "n_features": len(tech_features),
+            "base_holdout_accuracy": base_metrics["accuracy"],
+            "base_holdout_f1_macro": base_metrics["f1_macro"],
+            "late_fusion_holdout_accuracy": late_fusion_metrics["accuracy"],
+            "late_fusion_holdout_f1_macro": late_fusion_metrics["f1_macro"],
+            **fusion_stats,
+        },
+    }
+
+    model_path = os.path.join(models_dir, f"{symbol}_late_fusion_model.pkl")
+    with open(model_path, "wb") as f:
+        pickle.dump(bundle, f)
+
+    results_path = os.path.join(output_dir, f"{symbol}_late_fusion_results.json")
+    with open(results_path, "w") as f:
+        json.dump(bundle["metadata"], f, indent=2, default=str)
+
+    print(f"  Late-fusion model saved -> {model_path}")
+    print(f"  Late-fusion metrics -> {results_path}")
+    return bundle
+
+
+def train_and_save_late_fusion_universal(
+    df: pd.DataFrame,
+    train_end: str = "2023-12-31",
+    val_end: str | None = "2024-06-30",
+    tune: bool = False,
+    tune_trials: int = 50,
+    post_sentiment_start: str | None = None,
+    positive_threshold: float = 0.05,
+    negative_threshold: float = -0.05,
+    output_dir: str = "results",
+    models_dir: str = MODELS_DIR,
+) -> dict:
+    """
+    Train a universal technical base model and save a separate late-fusion
+    model bundle that applies sentiment as a final confirmation layer.
+    """
+    from src.ml.universe import temporal_train_test_split
+
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(models_dir, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print("  TRAINING UNIVERSAL LATE-FUSION MODEL")
+    print(f"{'='*60}")
+
+    df = _filter_post_sentiment_window(
+        df, post_sentiment_start, "Universal late-fusion post-sentiment filter"
+    )
+    tech_features = get_feature_columns(df, include_sentiment=False)
+
+    if val_end:
+        train_df, val_df, test_df = temporal_train_test_split(df, train_end, val_end)
+    else:
+        train_df, test_df = temporal_train_test_split(df, train_end)
+        val_df = None
+
+    if train_df.empty or test_df.empty:
+        raise ValueError("Not enough rows for universal late-fusion train/test split.")
+
+    print(f"  Train: {len(train_df)} rows")
+    if val_df is not None:
+        print(f"  Val:   {len(val_df)} rows")
+    print(f"  Test:  {len(test_df)} rows")
+
+    xgb_params = None
+    if tune:
+        print("\n  Running Optuna hyperparameter search on technical features ...")
+        xgb_params = tune_hyperparameters(
+            train_df,
+            tech_features,
+            label_col="label",
+            n_trials=tune_trials,
+        )
+
+    n_classes = int(train_df["label"].nunique())
+    model = (
+        _xgb_model_with_params(xgb_params, n_classes=n_classes)
+        if xgb_params
+        else _xgb_model(n_classes=n_classes)
+    )
+
+    if val_df is not None and len(val_df) > 0:
+        model.set_params(early_stopping_rounds=30)
+        model.fit(
+            train_df[tech_features],
+            train_df["label"],
+            eval_set=[(val_df[tech_features], val_df["label"])],
+            verbose=False,
+        )
+    else:
+        model.fit(train_df[tech_features], train_df["label"])
+
+    base_pred = model.predict(test_df[tech_features])
+    final_pred, fusion_stats = _late_fusion_adjust_predictions(
+        base_pred,
+        test_df,
+        positive_threshold=positive_threshold,
+        negative_threshold=negative_threshold,
+    )
+
+    base_metrics = _classification_metrics_dict(test_df["label"], base_pred)
+    late_fusion_metrics = _classification_metrics_dict(test_df["label"], final_pred)
+
+    print(
+        f"  Base technical model: acc={base_metrics['accuracy']:.4f} "
+        f"F1={base_metrics['f1_macro']:.4f}"
+    )
+    print(
+        f"  Late-fusion final:   acc={late_fusion_metrics['accuracy']:.4f} "
+        f"F1={late_fusion_metrics['f1_macro']:.4f}"
+    )
+    print(
+        f"  Sentiment vetoes: BUY={fusion_stats['buy_veto_count']} "
+        f"SELL={fusion_stats['sell_veto_count']}"
+    )
+
+    bundle = {
+        "model": model,
+        "feature_columns": tech_features,
+        "model_type": "late_fusion_universal",
+        "include_sentiment": True,
+        "fusion_config": {
+            "positive_threshold": positive_threshold,
+            "negative_threshold": negative_threshold,
+        },
+        "xgb_params": xgb_params,
+        "metadata": {
+            "train_end": train_end,
+            "val_end": val_end,
+            "post_sentiment_start": post_sentiment_start,
+            "n_train": len(train_df),
+            "n_test": len(test_df),
+            "n_features": len(tech_features),
+            "base_test_accuracy": base_metrics["accuracy"],
+            "base_test_f1_macro": base_metrics["f1_macro"],
+            "late_fusion_test_accuracy": late_fusion_metrics["accuracy"],
+            "late_fusion_test_f1_macro": late_fusion_metrics["f1_macro"],
+            **fusion_stats,
+        },
+    }
+
+    model_path = os.path.join(models_dir, "universal_late_fusion_model.pkl")
+    with open(model_path, "wb") as f:
+        pickle.dump(bundle, f)
+
+    results_path = os.path.join(output_dir, "universal_late_fusion_results.json")
+    with open(results_path, "w") as f:
+        json.dump(bundle["metadata"], f, indent=2, default=str)
+
+    print(f"  Universal late-fusion model saved -> {model_path}")
+    print(f"  Late-fusion metrics -> {results_path}")
+    return bundle
 
 
 # ---------------------------------------------------------------------------
@@ -1253,6 +1564,23 @@ def load_universal_model(models_dir: str = MODELS_DIR) -> dict:
     meta = bundle["metadata"]
     print(f"  Loaded universal model: {meta['n_features']} features, "
           f"trained on {meta['n_train']} samples")
+    return bundle
+
+
+def load_universal_late_fusion_model(models_dir: str = MODELS_DIR) -> dict:
+    """Load the universal late-fusion model bundle."""
+    path = os.path.join(models_dir, "universal_late_fusion_model.pkl")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            "No universal late-fusion model found. Run option 9 first."
+        )
+    with open(path, "rb") as f:
+        bundle = pickle.load(f)
+    meta = bundle["metadata"]
+    print(
+        f"  Loaded universal late-fusion model: {meta['n_features']} features, "
+        f"trained on {meta['n_train']} samples"
+    )
     return bundle
 
 

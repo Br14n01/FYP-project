@@ -10,6 +10,8 @@ Menu:
   6. Live signal (predict today's trading signal)
   7. Backtest simulation (day-by-day trading simulation)
   8. SHAP analysis (pretrained or universal model)
+  9. Train late-fusion model
+  10. Backtest late-fusion model
   0. Quit
 """
 
@@ -548,10 +550,21 @@ def finetune_and_evaluate():
         _, test_df = temporal_train_test_split(df_eval, train_end)
         if not test_df.empty:
             print(f"\n  Temporal test set: {len(test_df)} rows after {train_end}")
-            evaluate_universal_model(bundle, test_df, feature_cols)
+            evaluate_universal_model(
+                bundle,
+                test_df,
+                feature_cols,
+                report_label="universal_temporal",
+            )
 
     if held_out:
-        evaluate_held_out_stocks(bundle, df_eval, held_out, feature_cols)
+        evaluate_held_out_stocks(
+            bundle,
+            df_eval,
+            held_out,
+            feature_cols,
+            report_label="universal_held_out",
+        )
 
 
 # ===================================================================
@@ -583,7 +596,9 @@ def live_signal():
     per_ticker = [
         f.replace("_model.pkl", "")
         for f in os.listdir(models_dir)
-        if f.endswith("_model.pkl") and not f.startswith(("universal", "sector_"))
+        if f.endswith("_model.pkl")
+        and not f.startswith(("universal", "sector_"))
+        and not f.endswith("_late_fusion_model.pkl")
     ]
     has_universal = os.path.exists(os.path.join(models_dir, "universal_model.pkl"))
 
@@ -753,7 +768,9 @@ def backtest_simulation():
     per_ticker = [
         f.replace("_model.pkl", "")
         for f in os.listdir(models_dir)
-        if f.endswith("_model.pkl") and not f.startswith(("universal", "sector_"))
+        if f.endswith("_model.pkl")
+        and not f.startswith(("universal", "sector_"))
+        and not f.endswith("_late_fusion_model.pkl")
     ]
     has_universal = os.path.exists(os.path.join(models_dir, "universal_model.pkl"))
 
@@ -849,7 +866,9 @@ def shap_analysis():
         per_ticker = [
             f.replace("_model.pkl", "")
             for f in os.listdir(models_dir)
-            if f.endswith("_model.pkl") and not f.startswith(("universal", "sector_"))
+            if f.endswith("_model.pkl")
+            and not f.startswith(("universal", "sector_"))
+            and not f.endswith("_late_fusion_model.pkl")
         ]
         if not per_ticker:
             print("No pretrained per-ticker models found. Run option 3c first.")
@@ -990,6 +1009,170 @@ def shap_analysis():
 
 
 # ===================================================================
+# 9. Late-fusion model training
+# ===================================================================
+
+def train_late_fusion_models():
+    """Train and save separate late-fusion models."""
+    from src.ml.train import (
+        train_and_save_late_fusion_ticker,
+        train_and_save_late_fusion_universal,
+    )
+    from src.ml.universe import build_universal_dataset, get_all_tickers
+
+    print("\n  Late-fusion model options:")
+    print("    a = Per-ticker late-fusion model(s)")
+    print("    b = Universal late-fusion model")
+    sub = input("  Choose (a/b, default a): ").strip().lower() or "a"
+
+    if sub == "a":
+        start = input(f"Start date (default {DEFAULT_START}): ").strip() or DEFAULT_START
+        end = input("End date (default today): ").strip() or pd.Timestamp.now().strftime("%Y-%m-%d")
+        tickers_input = input(
+            f"Tickers (comma-separated, default {','.join(TARGET_TICKERS)}): "
+        ).strip()
+        tickers = (
+            [t.strip().upper() for t in tickers_input.split(",")]
+            if tickers_input
+            else TARGET_TICKERS
+        )
+        post_sentiment_start = input(
+            "Post-sentiment only from date (optional, press Enter for full history): "
+        ).strip() or None
+        pos_str = input("Positive sentiment threshold (default 0.05): ").strip() or "0.05"
+        neg_str = input("Negative sentiment threshold (default -0.05): ").strip() or "-0.05"
+
+        for ticker in tickers:
+            train_and_save_late_fusion_ticker(
+                ticker,
+                start=start,
+                end=end,
+                post_sentiment_start=post_sentiment_start,
+                positive_threshold=float(pos_str),
+                negative_threshold=float(neg_str),
+            )
+        return
+
+    if sub != "b":
+        print("  Invalid sub-option.")
+        return
+
+    start = input("Training data start (default 2019-01-01): ").strip() or "2019-01-01"
+    tickers_input = input(
+        "Tickers (comma-separated, or 'all' for full universe, default all): "
+    ).strip()
+    if tickers_input and tickers_input.lower() != "all":
+        tickers = [t.strip().upper() for t in tickers_input.split(",")]
+    else:
+        tickers = get_all_tickers()
+
+    train_end = input("Train cutoff date (default 2023-12-31): ").strip() or "2023-12-31"
+    val_end = input("Validation cutoff date (default 2024-06-30): ").strip() or "2024-06-30"
+    post_sentiment_start = input(
+        "Post-sentiment only from date (optional, press Enter for full history): "
+    ).strip() or None
+    pos_str = input("Positive sentiment threshold (default 0.05): ").strip() or "0.05"
+    neg_str = input("Negative sentiment threshold (default -0.05): ").strip() or "-0.05"
+    tune_input = input("Run Optuna hyperparameter tuning? (y/N): ").strip().lower()
+    do_tune = tune_input in ("y", "yes")
+
+    print(f"\n  Building universal dataset from {len(tickers)} tickers ...")
+    df = build_universal_dataset(
+        tickers=tickers,
+        start=start,
+        include_sentiment=True,
+        sentiment_start=None,
+    )
+
+    train_and_save_late_fusion_universal(
+        df,
+        train_end=train_end,
+        val_end=val_end,
+        tune=do_tune,
+        post_sentiment_start=post_sentiment_start,
+        positive_threshold=float(pos_str),
+        negative_threshold=float(neg_str),
+    )
+
+
+# ===================================================================
+# 10. Late-fusion backtest simulation
+# ===================================================================
+
+def backtest_late_fusion_model():
+    """Day-by-day backtest for saved late-fusion models."""
+    from src.ml.simulation import run_late_fusion_generalization_test
+
+    models_dir = "models"
+    if not os.path.exists(models_dir):
+        print("No models found. Run option 9 first.")
+        return
+
+    per_ticker = [
+        f.replace("_late_fusion_model.pkl", "")
+        for f in os.listdir(models_dir)
+        if f.endswith("_late_fusion_model.pkl") and f != "universal_late_fusion_model.pkl"
+    ]
+    has_universal = os.path.exists(
+        os.path.join(models_dir, "universal_late_fusion_model.pkl")
+    )
+
+    if not per_ticker and not has_universal:
+        print("No late-fusion models found. Run option 9 first.")
+        return
+
+    print("Available late-fusion models:")
+    if has_universal:
+        print("  [universal] - Cross-stock universal late-fusion model")
+    for t in per_ticker:
+        print(f"  [{t}] - Per-ticker late-fusion model")
+
+    model_choice = input(
+        "\nLate-fusion model to use (ticker name or 'universal', default universal): "
+    ).strip()
+
+    if not model_choice:
+        use_universal = has_universal
+        model_ticker = per_ticker[0] if per_ticker else "universal"
+    elif model_choice.lower() == "universal":
+        if not has_universal:
+            print("No universal late-fusion model found. Run option 9 first.")
+            return
+        use_universal = True
+        model_ticker = "universal"
+    else:
+        model_ticker = model_choice.upper()
+        if model_ticker not in per_ticker:
+            print(f"No late-fusion model for {model_ticker}.")
+            return
+        use_universal = False
+
+    test_input = input("Test tickers (comma-separated, default VOO,GOOG,JPM): ").strip()
+    test_tickers = (
+        [t.strip().upper() for t in test_input.split(",")]
+        if test_input
+        else ["VOO", "GOOG", "JPM"]
+    )
+
+    sim_start = input("Simulation start date (default 2026-03-01): ").strip() or "2026-03-01"
+    sim_end = input("Simulation end date (default 2026-04-01): ").strip() or "2026-04-01"
+    capital_str = input("Initial capital in USD (default 10000): ").strip() or "10000"
+    initial_capital = float(capital_str)
+    short_input = input("Allow short selling? (y/N): ").strip().lower()
+    allow_short = short_input in ("y", "yes")
+
+    run_late_fusion_generalization_test(
+        model_ticker=model_ticker,
+        test_tickers=test_tickers,
+        sim_start=sim_start,
+        sim_end=sim_end,
+        initial_capital=initial_capital,
+        use_universal=use_universal,
+        allow_short=allow_short,
+    )
+
+
+# ===================================================================
 # Main menu
 # ===================================================================
 
@@ -1004,6 +1187,8 @@ def main():
         print("  6 = Live signal (predict today's trading signal)")
         print("  7 = Backtest simulation (day-by-day trading simulation)")
         print("  8 = SHAP analysis (pretrained or universal model)")
+        print("  9 = Train late-fusion model")
+        print("  10 = Backtest late-fusion model")
         print("  0 = Quit")
         print()
 
@@ -1027,6 +1212,10 @@ def main():
             backtest_simulation()
         elif action == "8":
             shap_analysis()
+        elif action == "9":
+            train_late_fusion_models()
+        elif action == "10":
+            backtest_late_fusion_model()
         else:
             print("Invalid action.")
 

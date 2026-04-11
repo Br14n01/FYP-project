@@ -25,7 +25,13 @@ from src.ml.features import (
     add_relative_indicators,
     SENTIMENT_FEATURE_COLS,
 )
-from src.ml.train import load_pretrained, load_universal_model
+from src.ml.train import (
+    _late_fusion_adjust_predictions,
+    load_late_fusion_pretrained,
+    load_pretrained,
+    load_universal_late_fusion_model,
+    load_universal_model,
+)
 from src.sentiment.news_sentimental_analysis import SentimentScorer
 from src.sentiment.finnhub_news import fetch_historical_news
 
@@ -334,6 +340,234 @@ def run_simulation(
     return {"daily_log": log_df, "metrics": metrics, "trades": trades}
 
 
+def run_late_fusion_simulation(
+    model_ticker: str,
+    test_ticker: str,
+    sim_start: str = "2026-03-01",
+    sim_end: str = "2026-04-01",
+    initial_capital: float = 10_000.0,
+    articles_per_day: int = 5,
+    output_dir: str = "results",
+    use_universal: bool = False,
+    allow_short: bool = False,
+) -> dict:
+    """
+    Run a day-by-day trading simulation using a late-fusion model.
+
+    The base XGBoost model predicts from technical features, and sentiment
+    then confirms or vetoes directional trades before execution.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    model_label = "universal_late_fusion" if use_universal else f"{model_ticker}_late_fusion"
+    mode_str = "long + short" if allow_short else "long only"
+
+    print(f"\n{'='*60}")
+    print(f"  LATE-FUSION SIMULATION: model={model_label}, trading={test_ticker}")
+    print(f"  Period: {sim_start} -> {sim_end}")
+    print(f"  Capital: ${initial_capital:,.2f}  |  Mode: {mode_str}")
+    print(f"{'='*60}")
+
+    if use_universal:
+        bundle = load_universal_late_fusion_model()
+    else:
+        bundle = load_late_fusion_pretrained(model_ticker)
+    model = bundle["model"]
+    feature_cols = bundle["feature_columns"]
+    fusion_cfg = bundle.get("fusion_config", {})
+    positive_threshold = fusion_cfg.get("positive_threshold", 0.05)
+    negative_threshold = fusion_cfg.get("negative_threshold", -0.05)
+
+    lookback_start = (
+        datetime.strptime(sim_start, "%Y-%m-%d") - timedelta(days=400)
+    ).strftime("%Y-%m-%d")
+    sim_end_dt = datetime.strptime(sim_end, "%Y-%m-%d")
+    fetch_end = (sim_end_dt + timedelta(days=3)).strftime("%Y-%m-%d")
+
+    print(f"\n  Downloading price data for {test_ticker} ...")
+    price_df = download_price_data(test_ticker, start=lookback_start, end=fetch_end)
+    if price_df.empty:
+        print("  ERROR: No price data available.")
+        return {"error": "No price data"}
+
+    print(f"  Pre-fetching news for {test_ticker} ({sim_start} -> {sim_end}) ...")
+    news_df = fetch_historical_news(
+        test_ticker, sim_start, sim_end, save=False, rate_limit_pause=0.5
+    )
+
+    print("  Computing technical indicators ...")
+    df_ta = add_indicators(price_df)
+    if use_universal:
+        df_ta = add_relative_indicators(df_ta)
+    df_ta.dropna(inplace=True)
+    df_ta.index = pd.to_datetime(df_ta.index)
+    if df_ta.index.tz is not None:
+        df_ta.index = df_ta.index.tz_localize(None)
+
+    sim_start_dt = pd.Timestamp(sim_start)
+    sim_end_dt = pd.Timestamp(sim_end)
+    trading_days = df_ta.loc[sim_start_dt:sim_end_dt].index.tolist()
+    if not trading_days:
+        print("  ERROR: No trading days found in the simulation window.")
+        return {"error": "No trading days"}
+
+    print(f"  Found {len(trading_days)} trading days\n")
+
+    cash = initial_capital
+    shares = 0
+    daily_log = []
+    trades = []
+    sentiment_history = []
+    signal_map = {0: "HOLD", 1: "SELL", 2: "BUY"}
+
+    for i, day in enumerate(trading_days):
+        day_str = day.strftime("%Y-%m-%d")
+        close_price = float(df_ta.loc[day, "Close"])
+        is_last_day = (i == len(trading_days) - 1) or (day >= sim_end_dt)
+
+        articles = _get_news_by_date(news_df, day_str, max_articles=articles_per_day)
+        sent_features = _compute_daily_sentiment(articles)
+        sentiment_history.append(sent_features)
+
+        if len(sentiment_history) >= 3:
+            sent_features["sent_momentum_3d"] = np.mean([s["sent_mean"] for s in sentiment_history[-3:]])
+        if len(sentiment_history) >= 5:
+            sent_features["sent_momentum_5d"] = np.mean([s["sent_mean"] for s in sentiment_history[-5:]])
+            recent_means = [s["sent_mean"] for s in sentiment_history[-5:]]
+            sent_features["sent_vol_5d"] = float(np.std(recent_means))
+        if len(sentiment_history) >= 10:
+            sent_features["sent_momentum_10d"] = np.mean([s["sent_mean"] for s in sentiment_history[-10:]])
+
+        today_row = df_ta.loc[[day]].copy()
+        for col in feature_cols:
+            if col not in today_row.columns:
+                today_row[col] = 0.0
+
+        X_today = today_row[feature_cols]
+        base_prediction = int(model.predict(X_today)[0])
+        probabilities = model.predict_proba(X_today)[0]
+        confidence = float(max(probabilities))
+
+        context_row = pd.DataFrame([{**sent_features}], index=[day])
+        final_prediction = int(
+            _late_fusion_adjust_predictions(
+                np.array([base_prediction]),
+                context_row,
+                positive_threshold=positive_threshold,
+                negative_threshold=negative_threshold,
+            )[0][0]
+        )
+
+        action_taken = "HOLD"
+        if base_prediction != final_prediction:
+            action_taken = "VETO"
+        trade_shares = 0
+
+        if is_last_day and shares != 0:
+            if shares > 0:
+                cash += shares * close_price
+                trade_shares = -shares
+                action_taken = "CLOSE_ALL"
+                trades.append({
+                    "date": day_str, "action": "SELL (close)", "shares": abs(trade_shares),
+                    "price": close_price, "value": abs(trade_shares) * close_price,
+                })
+            else:
+                cover_cost = abs(shares) * close_price
+                cash -= cover_cost
+                trade_shares = abs(shares)
+                action_taken = "CLOSE_ALL"
+                trades.append({
+                    "date": day_str, "action": "COVER (close)", "shares": abs(shares),
+                    "price": close_price, "value": cover_cost,
+                })
+            shares = 0
+        elif final_prediction == 2 and shares == 0:
+            trade_shares = int(cash // close_price)
+            if trade_shares > 0:
+                cost = trade_shares * close_price
+                cash -= cost
+                shares += trade_shares
+                action_taken = "BUY"
+                trades.append({
+                    "date": day_str, "action": "BUY", "shares": trade_shares,
+                    "price": close_price, "value": cost,
+                })
+        elif final_prediction == 2 and shares < 0:
+            cover_cost = abs(shares) * close_price
+            cash -= cover_cost
+            trade_shares = abs(shares)
+            action_taken = "COVER"
+            trades.append({
+                "date": day_str, "action": "COVER", "shares": abs(shares),
+                "price": close_price, "value": cover_cost,
+            })
+            shares = 0
+        elif final_prediction == 1 and shares > 0:
+            revenue = shares * close_price
+            cash += revenue
+            trade_shares = -shares
+            action_taken = "SELL"
+            trades.append({
+                "date": day_str, "action": "SELL", "shares": shares,
+                "price": close_price, "value": revenue,
+            })
+            shares = 0
+        elif final_prediction == 1 and shares == 0 and allow_short:
+            short_shares = int(cash // close_price)
+            if short_shares > 0:
+                proceeds = short_shares * close_price
+                cash += proceeds
+                shares = -short_shares
+                trade_shares = -short_shares
+                action_taken = "SHORT"
+                trades.append({
+                    "date": day_str, "action": "SHORT", "shares": short_shares,
+                    "price": close_price, "value": proceeds,
+                })
+
+        portfolio_value = cash + shares * close_price
+
+        daily_log.append({
+            "date": day_str,
+            "close": close_price,
+            "base_signal": signal_map.get(base_prediction, str(base_prediction)),
+            "signal": signal_map.get(final_prediction, str(final_prediction)),
+            "action": action_taken,
+            "confidence": confidence,
+            "shares": shares,
+            "cash": cash,
+            "portfolio_value": portfolio_value,
+            "news_count": len(articles),
+            "sent_mean": sent_features["sent_mean"],
+        })
+
+        arrow = {
+            "BUY": ">>>",
+            "SELL": "<<<",
+            "SHORT": "vvv",
+            "COVER": "^^^",
+            "CLOSE_ALL": "XXX",
+            "VETO": "!!!",
+            "HOLD": "   ",
+        }
+        print(
+            f"  {day_str}  ${close_price:>8.2f}  "
+            f"base={signal_map.get(base_prediction, '?'):<4}  "
+            f"final={signal_map.get(final_prediction, '?'):<4}  "
+            f"{arrow.get(action_taken, '   ')} {action_taken:<10}  "
+            f"portfolio=${portfolio_value:>10,.2f}  "
+            f"news={len(articles)}  sent={sent_features['sent_mean']:+.3f}"
+        )
+
+    log_df = pd.DataFrame(daily_log)
+    metrics = _compute_metrics(log_df, initial_capital, trades)
+    _print_summary(model_label, test_ticker, sim_start, sim_end, metrics, trades)
+    _save_results(log_df, metrics, trades, model_label, test_ticker, output_dir)
+    _plot_capital(log_df, model_label, test_ticker, initial_capital, metrics, output_dir)
+    return {"daily_log": log_df, "metrics": metrics, "trades": trades}
+
+
 def _compute_metrics(log_df: pd.DataFrame, initial_capital: float, trades: list) -> dict:
     """Compute trading evaluation metrics."""
     final_value = log_df["portfolio_value"].iloc[-1]
@@ -575,6 +809,49 @@ def run_generalization_test(
             all_results[ticker] = {"error": str(e)}
 
     # Comparison table
+    _save_generalization_summary(model_label, all_results, output_dir)
+    return all_results
+
+
+def run_late_fusion_generalization_test(
+    model_ticker: str = "VOO",
+    test_tickers: list[str] | None = None,
+    sim_start: str = "2026-03-01",
+    sim_end: str = "2026-04-01",
+    initial_capital: float = 10_000.0,
+    output_dir: str = "results",
+    use_universal: bool = False,
+    allow_short: bool = False,
+) -> dict[str, dict]:
+    """Run generalization tests for late-fusion models."""
+    if test_tickers is None:
+        test_tickers = ["VOO", "GOOG", "JPM"]
+
+    model_label = (
+        "universal_late_fusion" if use_universal else f"{model_ticker}_late_fusion"
+    )
+    all_results = {}
+
+    for ticker in test_tickers:
+        print(f"\n{'#'*60}")
+        print(f"  LATE-FUSION GENERALIZATION TEST: {model_label} -> {ticker}")
+        print(f"{'#'*60}")
+        try:
+            result = run_late_fusion_simulation(
+                model_ticker=model_ticker,
+                test_ticker=ticker,
+                sim_start=sim_start,
+                sim_end=sim_end,
+                initial_capital=initial_capital,
+                output_dir=output_dir,
+                use_universal=use_universal,
+                allow_short=allow_short,
+            )
+            all_results[ticker] = result.get("metrics", {})
+        except Exception as e:
+            print(f"  ERROR simulating {ticker}: {e}")
+            all_results[ticker] = {"error": str(e)}
+
     _save_generalization_summary(model_label, all_results, output_dir)
     return all_results
 
