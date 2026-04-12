@@ -1202,6 +1202,7 @@ def train_universal_model(
     tune_trials: int = 50,
     models_dir: str = MODELS_DIR,
     post_sentiment_start: str | None = None,
+    feature_mode: str = "all_technical_relative_sentiment",
 ) -> dict:
     """
     Train a single XGBoost model on pooled multi-stock data.
@@ -1311,6 +1312,10 @@ def train_universal_model(
             "train_end": train_end,
             "val_end": val_end,
             "post_sentiment_start": post_sentiment_start,
+            "adaptive_label": True,
+            "label_threshold": 33.0,
+            "label_mode": "rolling_percentile",
+            "feature_mode": feature_mode,
             "n_train": len(train_df),
             "n_test": len(test_df),
             "n_features": len(feature_cols),

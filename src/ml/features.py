@@ -273,6 +273,37 @@ SENTIMENT_FEATURE_COLS = [
     "sent_momentum_10d",
     "sent_vol_5d",
 ]
+SCALE_INVARIANT_FEATURE_COLS = [
+    "close_to_sma5",
+    "close_to_ema5",
+    "close_to_sma10",
+    "close_to_ema10",
+    "close_to_sma20",
+    "close_to_ema20",
+    "sma5_to_sma20",
+    "sma10_to_sma20",
+    "close_to_vwma20",
+    "bb_pctb",
+    "bb_width_pct",
+    "kc_pctb",
+    "atr_pct",
+    "log_return_1d",
+    "log_return_5d",
+    "log_return_10d",
+    "log_return_20d",
+    "realized_vol_5d",
+    "realized_vol_10d",
+    "realized_vol_20d",
+    "return_accel",
+    "volume_ratio_5",
+    "volume_ratio_20",
+    "rsi_roc_5d",
+    "momentum_accel",
+    "dow_sin",
+    "dow_cos",
+    "month_sin",
+    "month_cos",
+]
 
 
 def build_feature_matrix(
@@ -361,6 +392,21 @@ def get_feature_columns(
     cols = [c for c in df.columns if c not in exclude]
     if not include_sentiment:
         cols = [c for c in cols if c not in SENTIMENT_FEATURE_COLS]
+    return cols
+
+
+def get_universal_feature_columns(
+    df: pd.DataFrame,
+    include_sentiment: bool = True,
+    scale_invariant_only: bool = False,
+) -> list[str]:
+    """Return universal-model features, optionally restricting to relative-only features."""
+    if not scale_invariant_only:
+        return get_feature_columns(df, include_sentiment=include_sentiment)
+
+    cols = [c for c in SCALE_INVARIANT_FEATURE_COLS if c in df.columns]
+    if include_sentiment:
+        cols.extend(c for c in SENTIMENT_FEATURE_COLS if c in df.columns)
     return cols
 
 

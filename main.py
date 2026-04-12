@@ -382,7 +382,7 @@ def train_universal():
     available.
     """
     from src.ml.universe import build_universal_dataset, get_all_tickers
-    from src.ml.features import get_feature_columns
+    from src.ml.features import get_universal_feature_columns
     from src.ml.train import train_universal_model, finetune_with_sentiment
 
     start = input("Training data start (default 2019-01-01): ").strip() or "2019-01-01"
@@ -405,18 +405,29 @@ def train_universal():
     tune_input = input("Run Optuna hyperparameter tuning? (y/N): ").strip().lower()
     do_tune = tune_input in ("y", "yes")
 
-    adaptive_input = input("Use adaptive labels? (y/N): ").strip().lower()
-    adaptive = adaptive_input in ("y", "yes")
+    print("\n  Universal feature-set options:")
+    print("    a = All technical + relative + sentiment features")
+    print("    b = Scale-invariant relative + sentiment only")
+    feature_input = input("  Choose feature set (a/b, default a): ").strip().lower() or "a"
+    if feature_input not in ("a", "b"):
+        print("  Invalid feature-set option.")
+        return
+    scale_invariant_only = feature_input == "b"
+
     post_sentiment_only_input = input(
         "Train/evaluate only on or after sentiment start? (y/N): "
     ).strip().lower()
     post_sentiment_only = post_sentiment_only_input in ("y", "yes")
-    label_thresh = 33.0 if adaptive else 0.01
+    adaptive = True
+    label_thresh = 33.0
 
     print(f"\n  Building universal dataset from {len(tickers)} tickers ...")
     print(f"  Sentiment columns included (zeroed before {sentiment_start})")
-    if adaptive:
-        print(f"  Adaptive label percentile: {label_thresh}")
+    print(f"  Using scale-invariant adaptive labels (rolling percentile = {label_thresh})")
+    if scale_invariant_only:
+        print("  Feature set: scale-invariant relative + sentiment only")
+    else:
+        print("  Feature set: all technical + relative + sentiment")
     df = build_universal_dataset(
         tickers=tickers,
         start=start,
@@ -426,7 +437,11 @@ def train_universal():
         adaptive_label=adaptive,
     )
 
-    feature_cols = get_feature_columns(df, include_sentiment=True)
+    feature_cols = get_universal_feature_columns(
+        df,
+        include_sentiment=True,
+        scale_invariant_only=scale_invariant_only,
+    )
 
     print("\n" + "=" * 60)
     print("  PHASE 1: Technical base model (multi-year data)")
@@ -438,6 +453,11 @@ def train_universal():
         val_end=val_end,
         tune=do_tune,
         post_sentiment_start=sentiment_start if post_sentiment_only else None,
+        feature_mode=(
+            "scale_invariant_plus_sentiment"
+            if scale_invariant_only
+            else "all_technical_relative_sentiment"
+        ),
     )
 
     print("\n" + "=" * 60)
@@ -471,6 +491,9 @@ def finetune_and_evaluate():
     bundle = load_universal_model()
     feature_cols = bundle["feature_columns"]
     include_sentiment = bundle.get("include_sentiment", False)
+    meta = bundle["metadata"]
+    adaptive_label = meta.get("adaptive_label", False)
+    label_thresh = meta.get("label_threshold", 0.01)
 
     # --- Sector fine-tuning ---
     ft_input = input("Fine-tune per sector? (y/N): ").strip().lower()
@@ -488,7 +511,11 @@ def finetune_and_evaluate():
 
         print(f"\n  Building dataset for fine-tuning ...")
         df_ft = build_universal_dataset(
-            tickers=tickers, start=start, include_sentiment=include_sentiment,
+            tickers=tickers,
+            start=start,
+            thresh=label_thresh,
+            include_sentiment=include_sentiment,
+            adaptive_label=adaptive_label,
         )
 
         finetune_all_sectors(
@@ -506,7 +533,7 @@ def finetune_and_evaluate():
         return
 
     start = input("Eval data start (default 2019-01-01): ").strip() or "2019-01-01"
-    post_sentiment_start = bundle["metadata"].get("post_sentiment_start")
+    post_sentiment_start = meta.get("post_sentiment_start")
 
     held_out_input = input(
         "Held-out tickers for unseen-stock test (comma-separated, default TSLA,NFLX,DIS): "
@@ -535,7 +562,11 @@ def finetune_and_evaluate():
 
     print(f"\n  Building dataset for evaluation ({len(unique_tickers)} tickers) ...")
     df_eval = build_universal_dataset(
-        tickers=unique_tickers, start=start, include_sentiment=include_sentiment,
+        tickers=unique_tickers,
+        start=start,
+        thresh=label_thresh,
+        include_sentiment=include_sentiment,
+        adaptive_label=adaptive_label,
     )
     if post_sentiment_start:
         pre_filter_rows = len(df_eval)
@@ -928,6 +959,8 @@ def shap_analysis():
     bundle = load_universal_model(models_dir=models_dir)
     include_sentiment = bundle.get("include_sentiment", False)
     meta = bundle["metadata"]
+    adaptive_label = meta.get("adaptive_label", False)
+    label_thresh = meta.get("label_threshold", 0.01)
 
     start = input("Dataset start (default 2019-01-01): ").strip() or "2019-01-01"
     tickers_input = input(
@@ -956,8 +989,10 @@ def shap_analysis():
     df = build_universal_dataset(
         tickers=tickers,
         start=start,
+        thresh=label_thresh,
         include_sentiment=include_sentiment,
         sentiment_start=sentiment_start,
+        adaptive_label=adaptive_label,
     )
 
     train_end = meta.get("train_end", "2023-12-31")
