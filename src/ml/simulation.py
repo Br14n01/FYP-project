@@ -710,7 +710,7 @@ def _plot_capital(
     output_dir: str,
 ):
     """Plot portfolio value over time with buy/sell markers."""
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), height_ratios=[3, 1], sharex=True)
+    fig, ax1 = plt.subplots(figsize=(12, 6))
 
     dates = pd.to_datetime(log_df["date"])
     portfolio = log_df["portfolio_value"]
@@ -743,14 +743,7 @@ def _plot_capital(
     )
     ax1.legend(loc="upper left")
     ax1.grid(True, alpha=0.3)
-
-    # Sentiment subplot
-    ax2.bar(dates, log_df["sent_mean"], color=["green" if s > 0 else "red" for s in log_df["sent_mean"]],
-            alpha=0.6, width=0.8)
-    ax2.axhline(y=0, color="gray", linestyle="-", alpha=0.3)
-    ax2.set_ylabel("Sentiment")
-    ax2.set_xlabel("Date")
-    ax2.grid(True, alpha=0.3)
+    ax1.set_xlabel("Date")
 
     fig.tight_layout()
     chart_dir = os.path.join(output_dir, "chart")
