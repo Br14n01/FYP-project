@@ -428,7 +428,10 @@ def train_universal():
 
     train_end = input("Train cutoff date (default 2023-12-31): ").strip() or "2023-12-31"
     val_end = input("Validation cutoff date (default 2024-06-30): ").strip() or "2024-06-30"
-    model_name = input("Universal model name (default universal): ").strip() or "universal"
+    model_name = input(
+        "Universal model short name (default universal). "
+        "Saves as universal_<name>_model.pkl — not the full filename: "
+    ).strip() or "universal"
 
     sentiment_start = input(
         "Sentiment data available from (default 2025-04-01): "
@@ -854,6 +857,7 @@ def backtest_simulation():
     Supports both per-ticker models and the universal cross-stock model.
     """
     from src.ml.simulation import run_generalization_test
+    from src.ml.train import _normalize_universal_model_name_for_load
 
     models_dir = "models"
     if not os.path.exists(models_dir):
@@ -885,11 +889,18 @@ def backtest_simulation():
             return
         use_universal = True
         default_universal = "universal" if "universal" in universal_models else universal_models[0]
-        universal_model_name = input(
-            f"Universal model name (default {default_universal}): "
+        univ_input = input(
+            f"Universal model name (default {default_universal}); "
+            f"short label or file e.g. universal_shap_5_model.pkl: "
         ).strip() or default_universal
+        universal_model_name = _normalize_universal_model_name_for_load(univ_input)
+        if univ_input != universal_model_name:
+            print(f"  Resolved to model name: {universal_model_name}")
         if universal_model_name not in universal_models:
-            print(f"No universal model named {universal_model_name}.")
+            print(
+                f"No universal model named '{universal_model_name}'. "
+                f"Known: {', '.join(universal_models)}"
+            )
             return
         model_ticker = "universal"
     elif model_type == "p":

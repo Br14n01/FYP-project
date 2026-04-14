@@ -8,6 +8,7 @@ Usage:
 """
 
 import os
+import re
 import json
 import pickle
 import warnings
@@ -1593,18 +1594,46 @@ def _compute_sector_metrics(
     return metrics
 
 
+def _normalize_universal_model_name_for_load(raw: str) -> str:
+    """
+    Accept either the short label used in training (e.g. ``shap_5``) or a
+    saved filename (e.g. ``universal_shap_5_model.pkl``) and return the
+    label that ``_get_universal_model_path`` expects.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "universal"
+    s = os.path.basename(s)
+    if s.lower().endswith(".pkl"):
+        s = s[:-4]
+    sl = s.lower()
+    if sl in ("universal", "universal_model"):
+        return "universal"
+    m = re.fullmatch(r"universal_(.+)_model", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return s
+
+
 def load_universal_model(
     models_dir: str = MODELS_DIR,
     model_name: str = "universal",
 ) -> dict:
     """Load the universal model bundle."""
-    path = _get_universal_model_path(models_dir, model_name)
+    normalized = _normalize_universal_model_name_for_load(model_name)
+    path = _get_universal_model_path(models_dir, normalized)
     if not os.path.exists(path):
-        raise FileNotFoundError(f"No universal model named '{model_name}' found.")
+        hint = ""
+        if normalized != (model_name or "").strip():
+            hint = f" (normalized from '{model_name}' to '{normalized}')"
+        raise FileNotFoundError(
+            f"No universal model named '{normalized}' found{hint}. "
+            f"Expected file: {path}"
+        )
     with open(path, "rb") as f:
         bundle = pickle.load(f)
     meta = bundle["metadata"]
-    display_name = meta.get("model_name", model_name)
+    display_name = meta.get("model_name", normalized)
     print(f"  Loaded universal model '{display_name}': {meta['n_features']} features, "
           f"trained on {meta['n_train']} samples")
     return bundle
