@@ -1203,6 +1203,7 @@ def train_universal_model(
     models_dir: str = MODELS_DIR,
     post_sentiment_start: str | None = None,
     feature_mode: str = "all_technical_relative_sentiment",
+    model_name: str = "universal",
 ) -> dict:
     """
     Train a single XGBoost model on pooled multi-stock data.
@@ -1316,6 +1317,7 @@ def train_universal_model(
             "label_threshold": 33.0,
             "label_mode": "rolling_percentile",
             "feature_mode": feature_mode,
+            "model_name": model_name,
             "n_train": len(train_df),
             "n_test": len(test_df),
             "n_features": len(feature_cols),
@@ -1325,9 +1327,7 @@ def train_universal_model(
         },
     }
 
-    path = os.path.join(models_dir, "universal_model.pkl")
-    with open(path, "wb") as f:
-        pickle.dump(bundle, f)
+    path = _save_universal_bundle(bundle, models_dir, model_name)
     print(f"\n  Universal model saved -> {path}")
 
     return bundle
@@ -1440,6 +1440,40 @@ def finetune_all_sectors(
     return results
 
 
+def _sanitize_artifact_name(name: str) -> str:
+    """Create a filesystem-friendly model identifier."""
+    sanitized = "".join(ch.lower() if ch.isalnum() else "_" for ch in name.strip())
+    sanitized = "_".join(part for part in sanitized.split("_") if part)
+    return sanitized or "universal"
+
+
+def _get_universal_model_path(models_dir: str, model_name: str = "universal") -> str:
+    """Return the save path for a named universal model."""
+    safe_name = _sanitize_artifact_name(model_name)
+    if safe_name == "universal":
+        filename = "universal_model.pkl"
+    else:
+        filename = f"universal_{safe_name}_model.pkl"
+    return os.path.join(models_dir, filename)
+
+
+def _save_universal_bundle(bundle: dict, models_dir: str, model_name: str) -> str:
+    """Save a universal bundle under its chosen name and refresh the default alias."""
+    os.makedirs(models_dir, exist_ok=True)
+    path = _get_universal_model_path(models_dir, model_name)
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+
+    safe_name = _sanitize_artifact_name(model_name)
+    if safe_name != "universal":
+        alias_path = _get_universal_model_path(models_dir, "universal")
+        with open(alias_path, "wb") as f:
+            pickle.dump(bundle, f)
+        print(f"  Default universal alias updated -> {alias_path}")
+
+    return path
+
+
 def finetune_with_sentiment(
     base_bundle: dict,
     df: pd.DataFrame,
@@ -1448,6 +1482,7 @@ def finetune_with_sentiment(
     label_col: str = "label",
     n_extra_rounds: int = 100,
     models_dir: str = MODELS_DIR,
+    model_name: str = "universal",
 ) -> dict:
     """
     Phase 2 of two-phase training: warm-start the base universal model
@@ -1516,6 +1551,7 @@ def finetune_with_sentiment(
         "metadata": {
             **base_bundle["metadata"],
             "sentiment_finetuned": True,
+            "model_name": model_name,
             "sentiment_start": sentiment_start,
             "n_sentiment_samples": len(recent),
             "n_extra_rounds": n_extra_rounds,
@@ -1524,9 +1560,7 @@ def finetune_with_sentiment(
         },
     }
 
-    path = os.path.join(models_dir, "universal_model.pkl")
-    with open(path, "wb") as f:
-        pickle.dump(bundle, f)
+    path = _save_universal_bundle(bundle, models_dir, model_name)
     print(f"  Sentiment-tuned universal model saved -> {path}")
 
     return bundle
@@ -1559,15 +1593,19 @@ def _compute_sector_metrics(
     return metrics
 
 
-def load_universal_model(models_dir: str = MODELS_DIR) -> dict:
+def load_universal_model(
+    models_dir: str = MODELS_DIR,
+    model_name: str = "universal",
+) -> dict:
     """Load the universal model bundle."""
-    path = os.path.join(models_dir, "universal_model.pkl")
+    path = _get_universal_model_path(models_dir, model_name)
     if not os.path.exists(path):
-        raise FileNotFoundError("No universal model found. Train one first.")
+        raise FileNotFoundError(f"No universal model named '{model_name}' found.")
     with open(path, "rb") as f:
         bundle = pickle.load(f)
     meta = bundle["metadata"]
-    print(f"  Loaded universal model: {meta['n_features']} features, "
+    display_name = meta.get("model_name", model_name)
+    print(f"  Loaded universal model '{display_name}': {meta['n_features']} features, "
           f"trained on {meta['n_train']} samples")
     return bundle
 

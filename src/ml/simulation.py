@@ -36,6 +36,13 @@ from src.sentiment.news_sentimental_analysis import SentimentScorer
 from src.sentiment.finnhub_news import fetch_historical_news
 
 
+def _sanitize_artifact_name(name: str) -> str:
+    """Create a filesystem-friendly chart identifier."""
+    sanitized = "".join(ch.lower() if ch.isalnum() else "_" for ch in name.strip())
+    sanitized = "_".join(part for part in sanitized.split("_") if part)
+    return sanitized or "simulation"
+
+
 def _compute_daily_sentiment(articles: list[dict]) -> dict:
     """Score a list of articles and return aggregated sentiment features."""
     if not articles:
@@ -88,6 +95,8 @@ def run_simulation(
     output_dir: str = "results",
     use_universal: bool = False,
     allow_short: bool = False,
+    universal_model_name: str = "universal",
+    chart_label: str | None = None,
 ) -> dict:
     """
     Run a day-by-day trading simulation.
@@ -122,7 +131,7 @@ def run_simulation(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    model_label = "universal" if use_universal else model_ticker
+    model_label = universal_model_name if use_universal else model_ticker
 
     mode_str = "long + short" if allow_short else "long only"
 
@@ -134,7 +143,7 @@ def run_simulation(
 
     # Load model
     if use_universal:
-        bundle = load_universal_model()
+        bundle = load_universal_model(model_name=universal_model_name)
     else:
         bundle = load_pretrained(model_ticker)
     model = bundle["model"]
@@ -335,7 +344,15 @@ def run_simulation(
 
     # Save outputs
     _save_results(log_df, metrics, trades, model_label, test_ticker, output_dir)
-    _plot_capital(log_df, model_label, test_ticker, initial_capital, metrics, output_dir)
+    _plot_capital(
+        log_df,
+        model_label,
+        test_ticker,
+        initial_capital,
+        metrics,
+        output_dir,
+        chart_label=chart_label,
+    )
 
     return {"daily_log": log_df, "metrics": metrics, "trades": trades}
 
@@ -708,6 +725,7 @@ def _plot_capital(
     initial_capital: float,
     metrics: dict,
     output_dir: str,
+    chart_label: str | None = None,
 ):
     """Plot portfolio value over time with buy/sell markers."""
     fig, ax1 = plt.subplots(figsize=(12, 6))
@@ -736,7 +754,7 @@ def _plot_capital(
 
     ax1.set_ylabel("Portfolio Value ($)")
     ax1.set_title(
-        f"Simulation: {model_ticker} model on {test_ticker}  |  "
+        f"Simulation: {chart_label or f'{model_ticker} model on {test_ticker}'}  |  "
         f"Return: {metrics['overall_return_pct']:+.2f}%  |  "
         f"Sharpe: {metrics['sharpe_ratio']:.2f}  |  "
         f"MaxDD: {metrics['max_drawdown_pct']:.2f}%"
@@ -748,7 +766,12 @@ def _plot_capital(
     fig.tight_layout()
     chart_dir = os.path.join(output_dir, "chart")
     os.makedirs(chart_dir, exist_ok=True)
-    path = os.path.join(chart_dir, f"sim_{model_ticker}_on_{test_ticker}_chart.png")
+    filename_label = (
+        f"{_sanitize_artifact_name(chart_label)}_on_{test_ticker}"
+        if chart_label
+        else f"sim_{model_ticker}_on_{test_ticker}"
+    )
+    path = os.path.join(chart_dir, f"{filename_label}_chart.png")
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  Chart saved -> {path}")
@@ -763,6 +786,8 @@ def run_generalization_test(
     output_dir: str = "results",
     use_universal: bool = False,
     allow_short: bool = False,
+    universal_model_name: str = "universal",
+    chart_label: str | None = None,
 ) -> dict[str, dict]:
     """
     Test whether a model generalizes to multiple tickers.
@@ -778,7 +803,7 @@ def run_generalization_test(
     if test_tickers is None:
         test_tickers = ["VOO", "GOOG", "JPM"]
 
-    model_label = "universal" if use_universal else model_ticker
+    model_label = universal_model_name if use_universal else model_ticker
     all_results = {}
 
     for ticker in test_tickers:
@@ -795,6 +820,8 @@ def run_generalization_test(
                 output_dir=output_dir,
                 use_universal=use_universal,
                 allow_short=allow_short,
+                universal_model_name=universal_model_name,
+                chart_label=chart_label,
             )
             all_results[ticker] = result.get("metrics", {})
         except Exception as e:

@@ -20,12 +20,43 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import pickle
 import numpy as np
 import pandas as pd
 
 TARGET_TICKERS = ["AAPL", "JPM", "CVX", "UNH", "VOO"]
 PRETRAIN_TICKERS = ["VOO", "GOOGL", "JPM"]
 DEFAULT_START = "2023-01-01"
+
+
+def _list_saved_models(models_dir: str = "models") -> tuple[list[str], list[str]]:
+    """Return saved per-ticker and universal model names."""
+    per_ticker = set()
+    universal = set()
+
+    if not os.path.exists(models_dir):
+        return [], []
+
+    for filename in os.listdir(models_dir):
+        if not filename.endswith("_model.pkl") or filename.endswith("_late_fusion_model.pkl"):
+            continue
+
+        path = os.path.join(models_dir, filename)
+        try:
+            with open(path, "rb") as f:
+                bundle = pickle.load(f)
+        except Exception:
+            continue
+
+        metadata = bundle.get("metadata", {})
+        model_type = bundle.get("model_type")
+
+        if model_type == "universal":
+            universal.add(metadata.get("model_name") or "universal")
+        elif not filename.startswith("sector_"):
+            per_ticker.add(metadata.get("symbol") or filename.replace("_model.pkl", ""))
+
+    return sorted(per_ticker), sorted(universal)
 
 
 # ===================================================================
@@ -397,6 +428,7 @@ def train_universal():
 
     train_end = input("Train cutoff date (default 2023-12-31): ").strip() or "2023-12-31"
     val_end = input("Validation cutoff date (default 2024-06-30): ").strip() or "2024-06-30"
+    model_name = input("Universal model name (default universal): ").strip() or "universal"
 
     sentiment_start = input(
         "Sentiment data available from (default 2025-04-01): "
@@ -443,6 +475,31 @@ def train_universal():
         scale_invariant_only=scale_invariant_only,
     )
 
+    n_features_before = len(feature_cols)
+    remove_input = input(
+        f"\nFeatures to remove (comma-separated, optional; {n_features_before} columns): "
+    ).strip()
+    if remove_input:
+        to_remove = [t.strip() for t in remove_input.split(",") if t.strip()]
+        if to_remove:
+            col_set = set(feature_cols)
+            unknown = [f for f in to_remove if f not in col_set]
+            if unknown:
+                print(
+                    "  Warning: these names are not in the current feature list (ignored): "
+                    + ", ".join(unknown)
+                )
+            remove_set = {f for f in to_remove if f in col_set}
+            if remove_set:
+                feature_cols = [c for c in feature_cols if c not in remove_set]
+                print(
+                    f"  Removed {len(remove_set)} feature(s): {', '.join(sorted(remove_set))}"
+                )
+                print(f"  Feature count: {n_features_before} -> {len(feature_cols)}")
+            if not feature_cols:
+                print("  Error: no features left after removal. Aborting.")
+                return
+
     print("\n" + "=" * 60)
     print("  PHASE 1: Technical base model (multi-year data)")
     print("=" * 60)
@@ -453,6 +510,7 @@ def train_universal():
         val_end=val_end,
         tune=do_tune,
         post_sentiment_start=sentiment_start if post_sentiment_only else None,
+        model_name=model_name,
         feature_mode=(
             "scale_invariant_plus_sentiment"
             if scale_invariant_only
@@ -466,10 +524,12 @@ def train_universal():
     bundle = finetune_with_sentiment(
         bundle, df, feature_cols,
         sentiment_start=sentiment_start,
+        model_name=model_name,
     )
 
     print("\n" + "=" * 60)
     print("  TWO-PHASE UNIVERSAL MODEL TRAINING COMPLETE")
+    print(f"  Model name: {model_name}")
     print("  Model saved in models/ directory")
     print("=" * 60)
 
@@ -800,44 +860,51 @@ def backtest_simulation():
         print("No models found. Run option 3c or 4 first.")
         return
 
-    per_ticker = [
-        f.replace("_model.pkl", "")
-        for f in os.listdir(models_dir)
-        if f.endswith("_model.pkl")
-        and not f.startswith(("universal", "sector_"))
-        and not f.endswith("_late_fusion_model.pkl")
-    ]
-    has_universal = os.path.exists(os.path.join(models_dir, "universal_model.pkl"))
+    per_ticker, universal_models = _list_saved_models(models_dir)
 
-    if not per_ticker and not has_universal:
+    if not per_ticker and not universal_models:
         print("No models found. Run option 3c or 4 first.")
         return
 
     print("Available models:")
-    if has_universal:
-        print("  [universal] - Cross-stock universal model")
+    if universal_models:
+        print("  Universal models:")
+        for name in universal_models:
+            print(f"    [{name}]")
     for t in per_ticker:
         print(f"  [{t}] - Per-ticker model")
 
-    model_choice = input(
-        "\nModel to use (ticker name or 'universal', default universal): "
-    ).strip()
+    model_type = input(
+        "\nUse universal or per-ticker model? (u/p, default u): "
+    ).strip().lower() or "u"
 
-    if not model_choice:
-        use_universal = has_universal
-        model_ticker = "VOO"
-    elif model_choice.lower() == "universal":
-        if not has_universal:
+    universal_model_name = "universal"
+    if model_type == "u":
+        if not universal_models:
             print("No universal model found. Run option 4 first.")
             return
         use_universal = True
+        default_universal = "universal" if "universal" in universal_models else universal_models[0]
+        universal_model_name = input(
+            f"Universal model name (default {default_universal}): "
+        ).strip() or default_universal
+        if universal_model_name not in universal_models:
+            print(f"No universal model named {universal_model_name}.")
+            return
         model_ticker = "universal"
-    else:
+    elif model_type == "p":
+        if not per_ticker:
+            print("No per-ticker model found. Run option 3c first.")
+            return
+        model_choice = input("Per-ticker model name: ").strip().upper()
         model_ticker = model_choice.upper()
         if model_ticker not in per_ticker:
             print(f"No pretrained model for {model_ticker}.")
             return
         use_universal = False
+    else:
+        print("Invalid model type.")
+        return
 
     test_input = input("Test tickers (comma-separated, default VOO,GOOG,JPM): ").strip()
     test_tickers = (
@@ -854,6 +921,7 @@ def backtest_simulation():
 
     short_input = input("Allow short selling? (y/N): ").strip().lower()
     allow_short = short_input in ("y", "yes")
+    chart_label = input("Custom chart name (optional): ").strip() or None
 
     run_generalization_test(
         model_ticker=model_ticker,
@@ -863,6 +931,8 @@ def backtest_simulation():
         initial_capital=initial_capital,
         use_universal=use_universal,
         allow_short=allow_short,
+        universal_model_name=universal_model_name,
+        chart_label=chart_label,
     )
 
 
